@@ -1,0 +1,206 @@
+# Helm Chart Values for DeepFilterNet Server
+
+# Deployment configuration
+replicaCount: 1
+
+image:
+  repository: your-registry.example.com/deepfilternet-server
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+# Image pull secrets for private registries
+imagePullSecrets: []
+# - name: regcred
+
+nameOverride: ""
+fullnameOverride: "deepfilternet-server"
+
+# Service configuration
+service:
+  type: NodePort
+  port: 8000
+  targetPort: 8000
+  nodePort: 30800  # Optional: specify node port (30000-32767)
+  annotations: {}
+
+# Ingress configuration (optional)
+ingress:
+  enabled: false
+  className: "nginx"
+  annotations: {}
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # nginx.ingress.kubernetes.io/websocket-services: "deepfilternet-server"
+  hosts:
+    - host: deepfilternet.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: deepfilternet-tls
+  #    hosts:
+  #      - deepfilternet.example.com
+
+# Health check probes
+probes:
+  readiness:
+    enabled: true
+    httpGet:
+      path: /ping
+      port: 8000
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    successThreshold: 1
+    failureThreshold: 3
+  
+  liveness:
+    enabled: true
+    httpGet:
+      path: /ping
+      port: 8000
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 5
+    successThreshold: 1
+    failureThreshold: 3
+
+# Resource limits and requests
+resources:
+  requests:
+    memory: "2Gi"
+    cpu: "1000m"
+    nvidia.com/gpu: "1"
+  limits:
+    memory: "8Gi"
+    cpu: "4000m"
+    nvidia.com/gpu: "1"
+
+# GPU configuration
+gpu:
+  enabled: true
+  count: 1
+  nodeSelector:
+    accelerator: nvidia-gpu
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+
+# Node selector (for GPU nodes or specific node pools)
+nodeSelector: {}
+  # accelerator: nvidia-gpu
+  # node-pool: gpu-pool
+
+# Tolerations
+tolerations: []
+  # - key: nvidia.com/gpu
+  #   operator: Exists
+  #   effect: NoSchedule
+
+# Affinity rules
+affinity: {}
+
+# Persistent storage for models
+persistence:
+  enabled: true
+  storageClassName: "standard"
+  accessMode: ReadOnlyMany
+  size: 5Gi
+  mountPath: /app/models
+  annotations: {}
+
+# Environment variables
+env:
+  - name: CUDA_VISIBLE_DEVICES
+    value: "0"
+  - name: PYTHONUNBUFFERED
+    value: "1"
+
+# Additional environment variables from ConfigMap or Secret
+envFrom: []
+# - configMapRef:
+#     name: deepfilternet-config
+# - secretRef:
+#     name: deepfilternet-secrets
+
+# ConfigMap data
+configMap:
+  enabled: true
+  data:
+    server_host: "0.0.0.0"
+    server_port: "8000"
+    log_level: "INFO"
+
+# Pod security context
+podSecurityContext:
+  runAsNonRoot: false  # GPU access may require root
+  fsGroup: 1000
+
+# Container security context
+securityContext:
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: false
+  runAsNonRoot: false
+  # runAsUser: 1000
+
+# Service account
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# Pod annotations
+podAnnotations: {}
+
+# Pod labels
+podLabels: {}
+
+# Autoscaling (not recommended for GPU workloads)
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # maxUnavailable: 1
+
+# Network policy
+networkPolicy:
+  enabled: false
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            name: default
+      ports:
+      - protocol: TCP
+        port: 8000
+
+# Monitoring (Prometheus)
+monitoring:
+  enabled: false
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    path: /metrics
+
+# Additional volumes
+extraVolumes: []
+# - name: extra-config
+#   configMap:
+#     name: extra-config
+
+# Additional volume mounts
+extraVolumeMounts: []
+# - name: extra-config
+#   mountPath: /etc/extra-config
+#   readOnly: true

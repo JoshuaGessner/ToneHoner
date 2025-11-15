@@ -1,0 +1,28 @@
+# Docker build context hygiene
+.git
+.gitignore
+.vscode
+.idea
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Python build outputs
+build/
+dist/
+*.egg-info/
+*.spec
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Local env
+.env
+
+# Large model artifacts (mount at runtime instead)
+models/*.pt
+models/*.pth
+models/*.onnx
+models/*.bin

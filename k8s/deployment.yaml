@@ -1,0 +1,136 @@
+# Kubernetes Deployment for DeepFilterNet Server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepfilternet-server
+  labels:
+    app: deepfilternet-server
+    version: v1.0.0
+spec:
+  replicas: 1  # Single replica due to GPU requirements
+  selector:
+    matchLabels:
+      app: deepfilternet-server
+  template:
+    metadata:
+      labels:
+        app: deepfilternet-server
+        version: v1.0.0
+    spec:
+      containers:
+      - name: deepfilternet
+        image: deepfilternet-server:latest  # Replace with your registry/image:tag
+        imagePullPolicy: IfNotPresent
+        
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        
+        # Readiness probe to check if server is ready
+        readinessProbe:
+          httpGet:
+            path: /ping
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        
+        # Liveness probe to restart if server becomes unresponsive
+        livenessProbe:
+          httpGet:
+            path: /ping
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        
+        # Resource limits and requests
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+            nvidia.com/gpu: "1"  # Request 1 GPU
+          limits:
+            memory: "8Gi"
+            cpu: "4000m"
+            nvidia.com/gpu: "1"  # Limit to 1 GPU
+        
+        # Environment variables
+        env:
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        
+        # Volume mounts for model storage
+        volumeMounts:
+        - name: model-storage
+          mountPath: /app/models
+          readOnly: true
+      
+      # Volumes
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: deepfilternet-models-pvc
+      
+      # GPU node selector (adjust based on your cluster)
+      nodeSelector:
+        accelerator: nvidia-gpu
+      
+      # Tolerations for GPU nodes
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+---
+# Persistent Volume Claim for model storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: deepfilternet-models-pvc
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard  # Adjust based on your storage class
+
+---
+# Service to expose the deployment
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepfilternet-server
+  labels:
+    app: deepfilternet-server
+spec:
+  type: NodePort
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    nodePort: 30800  # Optional: specify a node port (30000-32767 range)
+    protocol: TCP
+  selector:
+    app: deepfilternet-server
+
+---
+# ConfigMap for additional configuration (optional)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deepfilternet-config
+data:
+  server_host: "0.0.0.0"
+  server_port: "8000"
+  log_level: "INFO"

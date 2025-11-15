@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.spec
+
+# Local env/config
+.env
+*.log
+
+# IDE/editor
+.vscode/
+.idea/
+.DS_Store
+
+# Test & coverage
+.pytest_cache/
+.coverage*
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Audio/model artifacts
+models/*.pt
+models/*.pth
+models/*.onnx
+models/*.bin
+
+# Keep the models folder in git
+!models/.gitkeep
+
+# Client generated files
+client/__pycache__/
+client/build/
+client/dist/
+
+# Docker
+*.tar
+

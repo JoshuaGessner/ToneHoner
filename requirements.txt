@@ -1,0 +1,14 @@
+# FastAPI framework for building the API
+fastapi>=0.115.0
+
+# ASGI server for running FastAPI applications with standard extras
+uvicorn[standard]>=0.32.0
+
+# WebSocket support (included with FastAPI but explicit for clarity)
+websockets>=13.1
+
+# PyTorch for deep learning and model inference
+torch>=2.5.0
+
+# NumPy for audio data manipulation and conversion
+numpy>=2.1.0

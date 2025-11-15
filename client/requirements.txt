@@ -1,0 +1,11 @@
+# Audio I/O library for real-time audio capture and playback
+sounddevice>=0.5.1
+
+# NumPy for audio data manipulation
+numpy>=2.1.0
+
+# WebSocket client library for async communication
+websockets>=13.1
+
+# SciPy for signal processing utilities (optional but useful)
+scipy>=1.14.0
