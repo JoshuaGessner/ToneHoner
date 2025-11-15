@@ -49,3 +49,4 @@ client/dist/
 *.tar
 
 ToneHoner.code-workspace
+.python-version
