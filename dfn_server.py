@@ -262,24 +262,44 @@ def enhance_block(audio: torch.Tensor) -> torch.Tensor:
         start_time = time.time()
         num_samples = audio.shape[0]
         
-        # DeepFilterNet expects shape (channels, samples)
+        # DeepFilterNet's enhance() expects shape (channels, samples) for mono audio
         # Convert from (samples,) -> (1, samples) for mono
-        audio_input = audio.unsqueeze(0)  # Add channel dimension
+        audio_input = audio.unsqueeze(0)  # Add channel dimension: [samples] -> [1, samples]
         
         # Run enhancement using DeepFilterNet's enhance function
+        # NOTE: Do NOT move audio to device here - DeepFilterNet's enhance() handles
+        # device placement internally and expects CPU tensors for the analysis stage
         with torch.no_grad():
-            enhanced = _enhance_fn(_model, _df_state, audio_input.unsqueeze(0).to(_device))
-            # enhanced shape is (batch, channels, samples), squeeze to (samples,)
+            try:
+                # enhance() expects [channels, samples] and returns [channels, samples]
+                enhanced = _enhance_fn(_model, _df_state, audio_input)
+            except Exception as e:
+                print(f"Error in _enhance_fn: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+            
+            # enhanced shape is (channels, samples), squeeze to (samples,)
             # Ensure we move to CPU and detach before any further operations
-            enhanced = enhanced.squeeze(0).squeeze(0).detach().cpu()
+            try:
+                enhanced = enhanced.squeeze(0).detach().cpu()
+            except Exception as e:
+                print(f"Error during squeeze/detach/cpu: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
         
-        # Ensure output matches input length
+        # Ensure output matches input length (do this AFTER moving to CPU)
         if enhanced.shape[0] != num_samples:
             # Trim or pad to match input length
             if enhanced.shape[0] > num_samples:
                 enhanced = enhanced[:num_samples]
             else:
+                # Pad on CPU to ensure tensor stays on CPU
                 enhanced = torch.nn.functional.pad(enhanced, (0, num_samples - enhanced.shape[0]))
+        
+        # Final safety check - ensure tensor is on CPU and contiguous
+        enhanced = enhanced.cpu().contiguous()
         
         # Profiling output
         inference_time = time.time() - start_time
@@ -295,6 +315,8 @@ def enhance_block(audio: torch.Tensor) -> torch.Tensor:
     except Exception as e:
         print(f"Error during inference: {e}")
         print(f"Input shape: {audio.shape}, dtype: {audio.dtype}")
+        import traceback
+        traceback.print_exc()
         raise RuntimeError(f"Inference failed: {e}")
 
 
