@@ -1,0 +1,4 @@
+DeepFilterNet Model Information
+================================
+Model Type: DeepFilterNet3
+Device: cuda

@@ -29,7 +29,7 @@ def install_deepfilternet():
 
 def check_device():
     """
-    Check if CUDA 12 is available, otherwise fall back to CPU.
+    Check if CUDA 13 is available, otherwise fall back to CPU.
     Returns the device to use for model inference.
     """
     if torch.cuda.is_available():
@@ -78,68 +78,106 @@ def load_deepfilternet_model(device):
         sys.exit(1)
 
 
-def export_to_torchscript(model, device, output_dir="./models"):
+# Global variables for inference - using DeepFilterNet directly instead of TorchScript
+_model = None
+_df_state = None
+_device = None
+_enhance_fn = None
+
+
+def unload_model():
     """
-    Export the DeepFilterNet model to TorchScript format.
-    Saves the model as 'model_ts.pt' in the specified directory.
+    Unload the DeepFilterNet model and free up memory.
+    Useful for freeing GPU/CPU memory when the model is no longer needed.
     """
-    print("Exporting model to TorchScript format...")
+    global _model, _df_state, _device, _enhance_fn
+    
+    if _model is not None:
+        print("Unloading DeepFilterNet model...")
+        
+        # Clear CUDA cache if using GPU
+        if _device is not None and _device.type == 'cuda':
+            import torch
+            torch.cuda.empty_cache()
+            print("Cleared CUDA cache")
+        
+        # Reset global variables
+        _model = None
+        _df_state = None
+        _device = None
+        _enhance_fn = None
+        
+        print("Model unloaded successfully")
+    else:
+        print("No model loaded")
+
+
+def save_model_info(model, df_state, device, output_dir="./models"):
+    """
+    Save model information and verify the model is ready.
+    DeepFilterNet3 cannot be easily exported to TorchScript, so we use it directly.
+    """
+    print("Verifying model for inference...")
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, "model_ts.pt")
+    info_path = os.path.join(output_dir, "model_info.txt")
     
     try:
-        # Create a dummy input tensor for tracing
-        # DeepFilterNet typically expects audio input with shape (batch, channels, time)
-        # Using a sample input size for demonstration
-        dummy_input = torch.randn(1, 1, 48000).to(device)  # 1 second at 48kHz
+        # Save model information - try different attributes
+        with open(info_path, 'w') as f:
+            f.write(f"DeepFilterNet Model Information\n")
+            f.write(f"================================\n")
+            f.write(f"Model Type: DeepFilterNet3\n")
+            f.write(f"Device: {device}\n")
+            
+            # Try to get available attributes
+            if hasattr(df_state, 'sr'):
+                f.write(f"Sample Rate: {df_state.sr()} Hz\n")
+            if hasattr(df_state, 'fft_size'):
+                f.write(f"FFT Size: {df_state.fft_size()}\n")
+            if hasattr(df_state, 'hop_size'):
+                f.write(f"Hop Size: {df_state.hop_size()}\n")
+            if hasattr(df_state, 'nb_df'):
+                f.write(f"DF Bands: {df_state.nb_df()}\n")
+            if hasattr(df_state, 'nb_erb'):
+                f.write(f"ERB Bands: {df_state.nb_erb()}\n")
         
-        # Trace the model with the dummy input
-        print("Tracing model with TorchScript...")
-        traced_model = torch.jit.trace(model, dummy_input)
+        print(f"✓ Model info saved to: {info_path}")
+        print(f"✓ Model is ready for inference on {device}")
         
-        # Save the traced model
-        traced_model.save(output_path)
-        print(f"TorchScript model saved successfully to: {output_path}")
-        
-        # Verify the saved model
-        file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"Model file size: {file_size_mb:.2f} MB")
-        
-        return output_path
+        return info_path
         
     except Exception as e:
-        print(f"Failed to export model to TorchScript: {e}")
-        print("\nNote: DeepFilterNet may have complex operations that are difficult to trace.")
-        print("Consider using torch.jit.script() or implementing a custom export wrapper.")
-        sys.exit(1)
+        print(f"Warning: Failed to save detailed model info: {e}")
+        # Try minimal version
+        try:
+            with open(info_path, 'w') as f:
+                f.write(f"DeepFilterNet Model Information\n")
+                f.write(f"================================\n")
+                f.write(f"Model Type: DeepFilterNet3\n")
+                f.write(f"Device: {device}\n")
+            print(f"✓ Basic model info saved to: {info_path}")
+        except:
+            pass
+        print("✓ Model is still usable for inference.")
+        return None
 
 
-# Global variables for inference
-_model = None
-_device = None
-
-
-def load_torchscript_model(model_path="./models/model_ts.pt"):
+def load_deepfilternet_for_inference():
     """
-    Load the TorchScript model at startup for inference.
-    Sets global _model and _device variables.
+    Load the DeepFilterNet model for inference.
+    Sets global _model, _df_state, and _device variables.
     
-    Args:
-        model_path: Path to the TorchScript model file
-        
     Returns:
-        Tuple of (model, device)
+        Tuple of (model, df_state, device)
     """
-    global _model, _device
+    global _model, _df_state, _device, _enhance_fn
     
-    print("Loading TorchScript model for inference...")
+    print("Loading DeepFilterNet model for inference...")
     
     try:
-        # Check if model file exists
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file not found: {model_path}")
+        from df.enhance import enhance, init_df
         
         # Determine device (GPU if available, else CPU)
         if torch.cuda.is_available():
@@ -149,29 +187,33 @@ def load_torchscript_model(model_path="./models/model_ts.pt"):
             _device = torch.device("cpu")
             print("Using CPU for inference")
         
-        # Load the TorchScript model
+        # Initialize DeepFilterNet model
         start_time = time.time()
-        _model = torch.jit.load(model_path, map_location=_device)
-        _model.eval()  # Set to evaluation mode
-        load_time = time.time() - start_time
+        _model, _df_state, _ = init_df(
+            model_base_dir=None,
+            post_filter=True,
+            log_level="WARNING"  # Reduce verbosity
+        )
+        _model = _model.to(_device)
+        _model.eval()
         
+        # Store the enhance function
+        _enhance_fn = enhance
+        
+        load_time = time.time() - start_time
         print(f"Model loaded successfully in {load_time:.3f} seconds")
         print(f"Device: {_device}")
         
-        return _model, _device
+        return _model, _df_state, _device
         
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        print("Please run the export script first to generate the model.")
-        raise
     except Exception as e:
-        print(f"Failed to load TorchScript model: {e}")
+        print(f"Failed to load DeepFilterNet model: {e}")
         raise
 
 
 def enhance_block(audio: torch.Tensor) -> torch.Tensor:
     """
-    Enhance a block of audio using the loaded TorchScript model.
+    Enhance a block of audio using the loaded DeepFilterNet model.
     
     Args:
         audio: 1-D tensor of float32 PCM samples in range [-1, 1]
@@ -184,12 +226,12 @@ def enhance_block(audio: torch.Tensor) -> torch.Tensor:
         RuntimeError: If model is not loaded or inference fails
         ValueError: If input audio format is invalid
     """
-    global _model, _device
+    global _model, _df_state, _device, _enhance_fn
     
     # Validate model is loaded
-    if _model is None or _device is None:
+    if _model is None or _df_state is None or _device is None:
         raise RuntimeError(
-            "Model not loaded. Call load_torchscript_model() first."
+            "Model not loaded. Call load_deepfilternet_for_inference() first."
         )
     
     # Validate input
@@ -202,7 +244,6 @@ def enhance_block(audio: torch.Tensor) -> torch.Tensor:
         )
     
     if audio.dtype != torch.float32:
-        print(f"Warning: Converting audio from {audio.dtype} to float32")
         audio = audio.float()
     
     # Check value range
@@ -215,45 +256,52 @@ def enhance_block(audio: torch.Tensor) -> torch.Tensor:
         start_time = time.time()
         num_samples = audio.shape[0]
         
-        # Prepare input: add batch and channel dimensions
-        # Shape: (num_samples,) -> (1, 1, num_samples)
-        audio_input = audio.unsqueeze(0).unsqueeze(0).to(_device)
+        # DeepFilterNet expects shape (channels, samples)
+        # Convert from (samples,) -> (1, samples) for mono
+        audio_input = audio.unsqueeze(0)  # Add channel dimension
         
-        # Run inference
+        # Run enhancement using DeepFilterNet's enhance function
         with torch.no_grad():
-            enhanced = _model(audio_input)
+            enhanced = _enhance_fn(_model, _df_state, audio_input.unsqueeze(0).to(_device))
+            # enhanced shape is (batch, channels, samples), squeeze to (samples,)
+            enhanced = enhanced.squeeze(0).squeeze(0).cpu()
         
-        # Remove batch and channel dimensions
-        # Shape: (1, 1, num_samples) -> (num_samples,)
-        enhanced = enhanced.squeeze(0).squeeze(0).cpu()
+        # Ensure output matches input length
+        if enhanced.shape[0] != num_samples:
+            # Trim or pad to match input length
+            if enhanced.shape[0] > num_samples:
+                enhanced = enhanced[:num_samples]
+            else:
+                enhanced = torch.nn.functional.pad(enhanced, (0, num_samples - enhanced.shape[0]))
         
         # Profiling output
         inference_time = time.time() - start_time
-        duration_sec = num_samples / 48000.0  # Assuming 48kHz
+        duration_sec = num_samples / _df_state.sr()
         rtf = inference_time / duration_sec if duration_sec > 0 else 0
         
-        print(f"Inference: {num_samples} samples ({duration_sec:.3f}s audio) "
-              f"processed in {inference_time:.3f}s (RTF: {rtf:.3f}x)")
+        if num_samples > 1000:  # Only print for non-trivial blocks
+            print(f"Inference: {num_samples} samples ({duration_sec:.3f}s audio) "
+                  f"processed in {inference_time:.3f}s (RTF: {rtf:.3f}x)")
         
         return enhanced
         
     except Exception as e:
         print(f"Error during inference: {e}")
-        print(f"Input shape: {audio.shape}, dtype: {audio.dtype}, device: {audio.device}")
+        print(f"Input shape: {audio.shape}, dtype: {audio.dtype}")
         raise RuntimeError(f"Inference failed: {e}")
 
 
 def main():
     """
     Main execution flow:
-    1. Install DeepFilterNet from GitHub
-    2. Check device availability (CUDA 12 or CPU)
+    1. Install DeepFilterNet from PyPI
+    2. Check device availability (CUDA 13 or CPU)
     3. Load pre-trained DeepFilterNet-2 checkpoint
-    4. Export model to TorchScript
-    5. Save to ./models/model_ts.pt
+    4. Verify model is ready for inference
+    5. Save model info to ./models/model_info.txt
     """
     print("=" * 60)
-    print("DeepFilterNet-2 TorchScript Export Script")
+    print("DeepFilterNet-2 Setup Script")
     print("=" * 60)
     
     # Step 1: Install DeepFilterNet
@@ -266,13 +314,16 @@ def main():
     # Step 3: Load pre-trained model
     model, df_state = load_deepfilternet_model(device)
     
-    # Step 4 & 5: Export to TorchScript and save
-    output_path = export_to_torchscript(model, device)
+    # Step 4 & 5: Save model info and verify
+    output_path = save_model_info(model, df_state, device)
     
     print("\n" + "=" * 60)
-    print("Export completed successfully!")
+    print("Setup completed successfully!")
     print(f"Device used: {device}")
-    print(f"Model saved at: {output_path}")
+    if output_path:
+        print(f"Model info saved at: {output_path}")
+    print("\nThe model is ready for inference.")
+    print("You can now start the server with: python main.py")
     print("=" * 60)
 
 

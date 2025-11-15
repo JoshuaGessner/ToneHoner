@@ -1,5 +1,5 @@
-# Use NVIDIA PyTorch runtime image with CUDA support (latest stable)
-FROM nvcr.io/nvidia/pytorch:24.11-py3
+# Use NVIDIA PyTorch runtime image with CUDA 13 support
+FROM nvcr.io/nvidia/pytorch:25.01-py3
 
 # Set working directory in container
 WORKDIR /app

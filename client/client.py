@@ -64,7 +64,9 @@ import threading
 import argparse
 import sys
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+import wave
+from pathlib import Path
 
 # Audio configuration
 SAMPLE_RATE = 48000  # Hz - DeepFilterNet expects 48kHz
@@ -240,6 +242,145 @@ def list_audio_devices():
     print("To list devices anytime: python -m sounddevice\n")
 
 
+async def process_audio_file(input_file: str, output_file: str, server_url: str):
+    """
+    Process an audio file through the enhancement server and save the result.
+    
+    Args:
+        input_file: Path to input WAV file
+        output_file: Path to output WAV file
+        server_url: WebSocket server URL
+    """
+    print(f"\n{'='*60}")
+    print(f"Processing Audio File")
+    print(f"{'='*60}")
+    print(f"Input: {input_file}")
+    print(f"Output: {output_file}")
+    print(f"Server: {server_url}")
+    print(f"{'='*60}\n")
+    
+    # Read input WAV file
+    print("Reading input file...")
+    try:
+        with wave.open(input_file, 'rb') as wav_in:
+            sample_rate = wav_in.getframerate()
+            num_channels = wav_in.getnchannels()
+            sample_width = wav_in.getsampwidth()
+            num_frames = wav_in.getnframes()
+            
+            # Read all audio data
+            audio_bytes = wav_in.readframes(num_frames)
+            
+            # Convert to numpy array
+            if sample_width == 2:  # 16-bit
+                audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
+            else:
+                print(f"Error: Only 16-bit WAV files are supported (got {sample_width*8}-bit)")
+                return False
+            
+            # Convert stereo to mono if needed
+            if num_channels == 2:
+                print("Converting stereo to mono...")
+                audio_data = audio_data.reshape(-1, 2).mean(axis=1).astype(np.int16)
+                num_channels = 1
+            elif num_channels > 2:
+                print(f"Error: Only mono or stereo files are supported (got {num_channels} channels)")
+                return False
+            
+            duration_sec = num_frames / sample_rate
+            print(f"✓ Loaded: {num_frames} samples, {sample_rate}Hz, {num_channels} channel(s), {duration_sec:.2f}s")
+            
+            # Warn if sample rate doesn't match
+            if sample_rate != SAMPLE_RATE:
+                print(f"⚠ Warning: Sample rate is {sample_rate}Hz, server expects {SAMPLE_RATE}Hz")
+                print(f"  Audio will be processed as-is, but quality may be affected.")
+    
+    except FileNotFoundError:
+        print(f"Error: Input file not found: {input_file}")
+        return False
+    except Exception as e:
+        print(f"Error reading input file: {e}")
+        return False
+    
+    # Connect to server and process
+    print(f"\nConnecting to server: {server_url}")
+    enhanced_blocks = []
+    
+    try:
+        async with websockets.connect(server_url) as websocket:
+            print("✓ Connected to server")
+            
+            # Split audio into blocks
+            block_size = BLOCK_SIZE
+            num_blocks = (len(audio_data) + block_size - 1) // block_size
+            
+            print(f"\nProcessing {num_blocks} blocks...")
+            
+            for i in range(num_blocks):
+                start_idx = i * block_size
+                end_idx = min(start_idx + block_size, len(audio_data))
+                
+                # Get audio block
+                audio_block = audio_data[start_idx:end_idx]
+                
+                # Pad if necessary (last block might be shorter)
+                if len(audio_block) < block_size:
+                    audio_block = np.pad(
+                        audio_block,
+                        (0, block_size - len(audio_block)),
+                        mode='constant'
+                    )
+                
+                # Send block
+                audio_bytes_block = audio_block.astype(np.int16).tobytes()
+                await websocket.send(audio_bytes_block)
+                
+                # Receive enhanced block
+                enhanced_bytes = await websocket.recv()
+                enhanced_block = np.frombuffer(enhanced_bytes, dtype=np.int16)
+                enhanced_blocks.append(enhanced_block)
+                
+                # Progress indicator
+                if (i + 1) % 10 == 0 or (i + 1) == num_blocks:
+                    progress = (i + 1) / num_blocks * 100
+                    print(f"  Progress: {i + 1}/{num_blocks} blocks ({progress:.1f}%)")
+            
+            print(f"✓ Processed all {num_blocks} blocks")
+    
+    except Exception as e:
+        print(f"✗ Server error: {e}")
+        return False
+    
+    # Concatenate all enhanced blocks
+    print("\nAssembling output...")
+    enhanced_audio = np.concatenate(enhanced_blocks)
+    
+    # Trim to original length (remove padding)
+    enhanced_audio = enhanced_audio[:len(audio_data)]
+    
+    # Write output WAV file
+    print(f"Writing output file: {output_file}")
+    try:
+        with wave.open(output_file, 'wb') as wav_out:
+            wav_out.setnchannels(1)  # Mono
+            wav_out.setsampwidth(2)  # 16-bit
+            wav_out.setframerate(sample_rate)
+            wav_out.writeframes(enhanced_audio.tobytes())
+        
+        output_size = Path(output_file).stat().st_size / 1024 / 1024
+        print(f"✓ Output saved: {output_file} ({output_size:.2f} MB)")
+    
+    except Exception as e:
+        print(f"✗ Error writing output file: {e}")
+        return False
+    
+    print(f"\n{'='*60}")
+    print("✓✓✓ Processing Complete! ✓✓✓")
+    print(f"{'='*60}\n")
+    
+    return True
+
+
 async def main_async():
     """
     Main async function that starts the WebSocket handler and stats reporter.
@@ -259,7 +400,7 @@ def main():
     """
     Main function that sets up the audio stream and runs the async event loop.
     """
-    global running
+    global running, SERVER_URL, INPUT_DEVICE, OUTPUT_DEVICE
     
     parser = argparse.ArgumentParser(
         description="Real-time audio enhancement client for DeepFilterNet"
@@ -291,6 +432,16 @@ def main():
         action="store_true",
         help="Launch GUI for device selection and control"
     )
+    parser.add_argument(
+        "--file",
+        type=str,
+        help="Process an audio file instead of real-time streaming (WAV format)"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        help="Output file path (default: adds '_enhanced' suffix to input filename)"
+    )
     
     args = parser.parse_args()
     
@@ -303,8 +454,22 @@ def main():
     if args.gui:
         return launch_gui()
     
+    # Process file if requested
+    if args.file:
+        input_file = args.file
+        
+        # Generate output filename if not provided
+        if args.output:
+            output_file = args.output
+        else:
+            input_path = Path(input_file)
+            output_file = str(input_path.parent / f"{input_path.stem}_enhanced{input_path.suffix}")
+        
+        # Process the file
+        success = asyncio.run(process_audio_file(input_file, output_file, args.server))
+        sys.exit(0 if success else 1)
+    
     # Update global configuration
-    global SERVER_URL, INPUT_DEVICE, OUTPUT_DEVICE
     SERVER_URL = args.server
     INPUT_DEVICE = args.input_device
     OUTPUT_DEVICE = args.output_device
@@ -348,10 +513,6 @@ def main():
         print(f"Blocks received: {stats['blocks_received']}")
         print(f"Errors: {stats['errors']}")
         print("\nClient stopped.")
-
-
-if __name__ == "__main__":
-    main()
 
 
 # =====================
@@ -446,53 +607,60 @@ def launch_gui():
 
     root = tk.Tk()
     root.title("ToneHoner Client")
-    root.geometry("520x360")
+    root.geometry("600x450")
 
-    main_frame = ttk.Frame(root, padding=12)
-    main_frame.pack(fill=tk.BOTH, expand=True)
+    # Create notebook (tabbed interface)
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    # ========================================
+    # TAB 1: Real-time Streaming
+    # ========================================
+    stream_frame = ttk.Frame(notebook, padding=12)
+    notebook.add(stream_frame, text="Real-time Streaming")
 
     # Server URL
-    ttk.Label(main_frame, text="Server URL").grid(row=0, column=0, sticky=tk.W)
+    ttk.Label(stream_frame, text="Server URL").grid(row=0, column=0, sticky=tk.W)
     server_var = tk.StringVar(value=SERVER_URL)
-    server_entry = ttk.Entry(main_frame, textvariable=server_var, width=45)
+    server_entry = ttk.Entry(stream_frame, textvariable=server_var, width=45)
     server_entry.grid(row=0, column=1, columnspan=2, sticky=tk.W)
 
     # Devices
     in_choices, out_choices = _get_device_choices()
 
-    ttk.Label(main_frame, text="Input Device").grid(row=1, column=0, sticky=tk.W, pady=(8,0))
+    ttk.Label(stream_frame, text="Input Device").grid(row=1, column=0, sticky=tk.W, pady=(8,0))
     in_var = tk.StringVar(value=in_choices[0][0])
-    in_combo = ttk.Combobox(main_frame, textvariable=in_var, values=[c[0] for c in in_choices], state="readonly", width=42)
+    in_combo = ttk.Combobox(stream_frame, textvariable=in_var, values=[c[0] for c in in_choices], state="readonly", width=42)
     in_combo.grid(row=1, column=1, columnspan=2, sticky=tk.W, pady=(8,0))
 
-    ttk.Label(main_frame, text="Output Device").grid(row=2, column=0, sticky=tk.W, pady=(8,0))
+    ttk.Label(stream_frame, text="Output Device").grid(row=2, column=0, sticky=tk.W, pady=(8,0))
     out_var = tk.StringVar(value=out_choices[0][0])
-    out_combo = ttk.Combobox(main_frame, textvariable=out_var, values=[c[0] for c in out_choices], state="readonly", width=42)
+    out_combo = ttk.Combobox(stream_frame, textvariable=out_var, values=[c[0] for c in out_choices], state="readonly", width=42)
     out_combo.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=(8,0))
 
     # Controls
-    start_btn = ttk.Button(main_frame, text="Start")
-    stop_btn = ttk.Button(main_frame, text="Stop", state=tk.DISABLED)
+    start_btn = ttk.Button(stream_frame, text="Start")
+    stop_btn = ttk.Button(stream_frame, text="Stop", state=tk.DISABLED)
     start_btn.grid(row=3, column=1, sticky=tk.W, pady=(12,4))
     stop_btn.grid(row=3, column=2, sticky=tk.W, pady=(12,4))
 
     # Stats
-    sep = ttk.Separator(main_frame)
+    sep = ttk.Separator(stream_frame)
     sep.grid(row=4, column=0, columnspan=3, sticky="ew", pady=8)
 
-    stats_title = ttk.Label(main_frame, text="Stats", font=("Segoe UI", 10, "bold"))
+    stats_title = ttk.Label(stream_frame, text="Stats", font=("Segoe UI", 10, "bold"))
     stats_title.grid(row=5, column=0, sticky=tk.W)
 
     blocks_sent_var = tk.StringVar(value="0")
     blocks_recv_var = tk.StringVar(value="0")
     errors_var = tk.StringVar(value="0")
 
-    ttk.Label(main_frame, text="Blocks sent:").grid(row=6, column=0, sticky=tk.W)
-    ttk.Label(main_frame, textvariable=blocks_sent_var).grid(row=6, column=1, sticky=tk.W)
-    ttk.Label(main_frame, text="Blocks received:").grid(row=7, column=0, sticky=tk.W)
-    ttk.Label(main_frame, textvariable=blocks_recv_var).grid(row=7, column=1, sticky=tk.W)
-    ttk.Label(main_frame, text="Errors:").grid(row=8, column=0, sticky=tk.W)
-    ttk.Label(main_frame, textvariable=errors_var).grid(row=8, column=1, sticky=tk.W)
+    ttk.Label(stream_frame, text="Blocks sent:").grid(row=6, column=0, sticky=tk.W)
+    ttk.Label(stream_frame, textvariable=blocks_sent_var).grid(row=6, column=1, sticky=tk.W)
+    ttk.Label(stream_frame, text="Blocks received:").grid(row=7, column=0, sticky=tk.W)
+    ttk.Label(stream_frame, textvariable=blocks_recv_var).grid(row=7, column=1, sticky=tk.W)
+    ttk.Label(stream_frame, text="Errors:").grid(row=8, column=0, sticky=tk.W)
+    ttk.Label(stream_frame, textvariable=errors_var).grid(row=8, column=1, sticky=tk.W)
 
     # Helpers to map label text -> index
     in_map = {label: idx for label, idx in in_choices}
@@ -527,6 +695,127 @@ def launch_gui():
             errors_var.set(str(stats.get("errors", 0)))
         root.after(1000, refresh_stats)
 
+    # ========================================
+    # TAB 2: File Processing
+    # ========================================
+    file_frame = ttk.Frame(notebook, padding=12)
+    notebook.add(file_frame, text="File Processing")
+
+    # Server URL for file processing
+    ttk.Label(file_frame, text="Server URL").grid(row=0, column=0, sticky=tk.W)
+    file_server_var = tk.StringVar(value=SERVER_URL)
+    file_server_entry = ttk.Entry(file_frame, textvariable=file_server_var, width=45)
+    file_server_entry.grid(row=0, column=1, columnspan=2, sticky=tk.W+tk.E)
+
+    # Input file selection
+    ttk.Label(file_frame, text="Input File").grid(row=1, column=0, sticky=tk.W, pady=(8,0))
+    input_file_var = tk.StringVar(value="")
+    input_file_entry = ttk.Entry(file_frame, textvariable=input_file_var, width=35)
+    input_file_entry.grid(row=1, column=1, sticky=tk.W+tk.E, pady=(8,0))
+    
+    def browse_input():
+        filename = filedialog.askopenfilename(
+            title="Select Input Audio File",
+            filetypes=[("WAV files", "*.wav"), ("All files", "*.*")]
+        )
+        if filename:
+            input_file_var.set(filename)
+            # Auto-generate output filename
+            if not output_file_var.get():
+                input_path = Path(filename)
+                output_file_var.set(str(input_path.parent / f"{input_path.stem}_enhanced{input_path.suffix}"))
+    
+    input_browse_btn = ttk.Button(file_frame, text="Browse...", command=browse_input)
+    input_browse_btn.grid(row=1, column=2, sticky=tk.W, padx=(4,0), pady=(8,0))
+
+    # Output file selection
+    ttk.Label(file_frame, text="Output File").grid(row=2, column=0, sticky=tk.W, pady=(8,0))
+    output_file_var = tk.StringVar(value="")
+    output_file_entry = ttk.Entry(file_frame, textvariable=output_file_var, width=35)
+    output_file_entry.grid(row=2, column=1, sticky=tk.W+tk.E, pady=(8,0))
+    
+    def browse_output():
+        filename = filedialog.asksaveasfilename(
+            title="Select Output Audio File",
+            defaultextension=".wav",
+            filetypes=[("WAV files", "*.wav"), ("All files", "*.*")]
+        )
+        if filename:
+            output_file_var.set(filename)
+    
+    output_browse_btn = ttk.Button(file_frame, text="Browse...", command=browse_output)
+    output_browse_btn.grid(row=2, column=2, sticky=tk.W, padx=(4,0), pady=(8,0))
+
+    # Process button
+    process_btn = ttk.Button(file_frame, text="Process File")
+    process_btn.grid(row=3, column=1, sticky=tk.W, pady=(12,4))
+
+    # Progress and status
+    sep2 = ttk.Separator(file_frame)
+    sep2.grid(row=4, column=0, columnspan=3, sticky="ew", pady=8)
+
+    status_label = ttk.Label(file_frame, text="Status", font=("Segoe UI", 10, "bold"))
+    status_label.grid(row=5, column=0, sticky=tk.W)
+
+    progress_var = tk.StringVar(value="Ready")
+    progress_label = ttk.Label(file_frame, textvariable=progress_var, wraplength=500)
+    progress_label.grid(row=6, column=0, columnspan=3, sticky=tk.W)
+
+    # Progress bar
+    progress_bar = ttk.Progressbar(file_frame, mode='indeterminate', length=400)
+    progress_bar.grid(row=7, column=0, columnspan=3, sticky=tk.W+tk.E, pady=(8,0))
+
+    def process_file():
+        input_file = input_file_var.get().strip()
+        output_file = output_file_var.get().strip()
+        server_url = file_server_var.get().strip()
+
+        if not input_file:
+            messagebox.showerror("Error", "Please select an input file")
+            return
+        
+        if not output_file:
+            messagebox.showerror("Error", "Please select an output file")
+            return
+
+        # Disable button and start progress
+        process_btn.config(state=tk.DISABLED)
+        progress_var.set(f"Processing: {Path(input_file).name}")
+        progress_bar.start(10)
+
+        # Run processing in background thread
+        def process_thread():
+            try:
+                success = asyncio.run(process_audio_file(input_file, output_file, server_url))
+                
+                # Update UI in main thread
+                root.after(0, lambda: progress_bar.stop())
+                root.after(0, lambda: process_btn.config(state=tk.NORMAL))
+                
+                if success:
+                    root.after(0, lambda: progress_var.set(f"✓ Complete! Saved to: {Path(output_file).name}"))
+                    root.after(0, lambda: messagebox.showinfo("Success", f"File processed successfully!\n\nOutput: {output_file}"))
+                else:
+                    root.after(0, lambda: progress_var.set("✗ Processing failed. Check console for details."))
+                    root.after(0, lambda: messagebox.showerror("Error", "Processing failed. Check console for details."))
+            
+            except Exception as e:
+                root.after(0, lambda: progress_bar.stop())
+                root.after(0, lambda: process_btn.config(state=tk.NORMAL))
+                root.after(0, lambda: progress_var.set(f"✗ Error: {str(e)}"))
+                root.after(0, lambda: messagebox.showerror("Error", f"Processing error: {str(e)}"))
+
+        thread = threading.Thread(target=process_thread, daemon=True)
+        thread.start()
+
+    process_btn.config(command=process_file)
+
+    # Configure grid weights for resizing
+    file_frame.columnconfigure(1, weight=1)
+
+    # ========================================
+    # Main window cleanup
+    # ========================================
     def on_close():
         try:
             controller.stop()
@@ -537,3 +826,7 @@ def launch_gui():
     root.protocol("WM_DELETE_WINDOW", on_close)
     refresh_stats()
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

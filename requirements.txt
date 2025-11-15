@@ -7,11 +7,13 @@ uvicorn[standard]>=0.32.0
 # WebSocket support (included with FastAPI but explicit for clarity)
 websockets>=13.1
 
-# PyTorch for deep learning and model inference
-torch>=2.5.0
+# PyTorch for deep learning and model inference (CUDA 13 compatible)
+# Using 2.5.1 which supports CUDA 12.4+ and is compatible with DeepFilterNet
+torch>=2.5.1,<2.6.0
 
-# TorchAudio for audio processing utilities
-torchaudio>=2.5.0
+# TorchAudio for audio processing utilities (CUDA 13 compatible)
+# Using 2.5.1 for compatibility with DeepFilterNet (torchaudio.backend still exists)
+torchaudio>=2.5.1,<2.6.0
 
 # NumPy for audio data manipulation and conversion
 numpy>=2.1.0

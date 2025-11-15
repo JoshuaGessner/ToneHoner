@@ -34,7 +34,7 @@ Mic (int16) → Client (int16 → float32 → WS) → Server (float32 → enhanc
 
 - Python: 3.10+ recommended (tested with 3.11)
 - OS: Windows/macOS/Linux
-- GPU (optional): NVIDIA CUDA 12.x for GPU acceleration; otherwise CPU fallback works
+- GPU (optional): NVIDIA CUDA 13.x for GPU acceleration; otherwise CPU fallback works
 - Virtual audio device (for client output to apps):
   - Windows: VB-Cable (Chocolatey or manual)
   - macOS: BlackHole (Homebrew)
@@ -59,7 +59,7 @@ Expected output (abbrev.):
 ```
 DeepFilterNet-2 TorchScript Export Script
 Installing DeepFilterNet from GitHub...
-CUDA is available! Version: 12.x  # or CPU fallback
+CUDA is available! Version: 13.x  # or CPU fallback
 DeepFilterNet-2 loaded successfully on cuda:0
 Tracing model with TorchScript...
 TorchScript model saved successfully to: ./models/model_ts.pt
@@ -99,6 +99,37 @@ pip install -r client/requirements.txt
 
 # GUI mode (recommended)
 python client/client.py --gui
+
+# File processing mode
+python client/client.py --file input.wav --output output_enhanced.wav
+```
+
+The client now supports two modes:
+
+1. **GUI Mode (Recommended)**: A tabbed interface with two tabs:
+   - **Real-time Streaming**: Capture audio from microphone → enhance → output to virtual device
+     - Select input/output devices
+     - Start/stop streaming
+     - View statistics (blocks sent/received, errors)
+   - **File Processing**: Process audio files in batch mode
+     - Browse and select input WAV file
+     - Browse and select output location (auto-suggests filename)
+     - Process file with progress bar and status updates
+     - Both tabs can specify different server URLs
+
+2. **CLI Mode**: Command-line operation
+   - Real-time: `python client/client.py --server ws://localhost:8000/enhance`
+   - File processing: `python client/client.py --file input.wav --output output.wav --server ws://localhost:8000/enhance`
+
+```powershell
+# List audio devices
+python client/client.py --list-devices
+
+# CLI: Real-time streaming with specific devices
+python client/client.py --input 1 --output 3
+
+# CLI: File processing
+python client/client.py --file audio.wav --output enhanced.wav
 
 # CLI mode
 python client/client.py --list-devices
@@ -157,7 +188,7 @@ More options (icons, signing, installers, AppImage, DEB) in `PACKAGING.md`.
 
 ## Docker
 
-Build and run the GPU-enabled container (uses `nvcr.io/nvidia/pytorch:24.11-py3`).
+Build and run the GPU-enabled container (uses `nvcr.io/nvidia/pytorch:25.01-py3` with CUDA 13 support).
 
 ```bash
 # Build image (from repo root)
@@ -218,7 +249,7 @@ helm install deepfilternet-server ./deepfilternet-server -f k8s/values.yaml \
   - Ensure sample rate is 48 kHz; resample if needed
   - In GUI mode, verify you clicked Start and selected valid devices
 - GPU memory or CUDA errors
-  - Ensure NVIDIA driver + CUDA 12.x match PyTorch version
+  - Ensure NVIDIA driver + CUDA 13.x match PyTorch version
   - Use `docker run --gpus all` or K8s GPU resources
   - Fall back to CPU: server will still run, but slower
 - WebSocket disconnects / frame errors

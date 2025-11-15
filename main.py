@@ -3,32 +3,59 @@ FastAPI WebSocket server for DeepFilterNet audio enhancement.
 This is a minimal skeleton with health check and WebSocket placeholder.
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import numpy as np
 import torch
+import os
 
 # Import the enhancement function from dfn_server
-from dfn_server import enhance_block, load_torchscript_model
+from dfn_server import enhance_block, load_deepfilternet_for_inference, unload_model
 
 # Initialize FastAPI application
 app = FastAPI(title="DeepFilterNet Audio Enhancement API")
+
+# CORS middleware - configure allowed origins for production
+# For development, allow all origins. For production, specify your domains.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Change to specific domains in production: ["https://yourdomain.com"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Optional: Simple API key authentication
+# Set environment variable: API_KEY=your_secret_key
+API_KEY = os.getenv("API_KEY", None)  # None = no authentication required
 
 
 @app.on_event("startup")
 async def startup_event():
     """
-    Load the TorchScript model at server startup.
+    Load the DeepFilterNet model at server startup.
     This ensures the model is ready before accepting WebSocket connections.
     """
     print("Loading DeepFilterNet model...")
     try:
-        load_torchscript_model("./models/model_ts.pt")
+        load_deepfilternet_for_inference()
         print("Model loaded successfully - server ready!")
     except Exception as e:
         print(f"ERROR: Failed to load model: {e}")
         print("Server will start but enhancement will not work.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """
+    Unload the DeepFilterNet model at server shutdown.
+    This frees up memory and GPU resources.
+    """
+    print("Shutting down server...")
+    unload_model()
+    print("Server shutdown complete")
 
 
 @app.post("/ping")
@@ -46,7 +73,7 @@ async def websocket_enhance(websocket: WebSocket):
     WebSocket endpoint for real-time audio enhancement.
     
     Expected flow:
-    1. Client connects to /enhance
+    1. Client connects to /enhance (optionally with ?api_key=xxx)
     2. Client sends raw PCM audio frames as bytes (int16 format)
     3. Server converts to float32, processes with DeepFilterNet
     4. Server converts back to int16 and sends enhanced audio frames
@@ -56,9 +83,19 @@ async def websocket_enhance(websocket: WebSocket):
     - Sample rate: 48kHz (or as required by model)
     - Channels: mono
     """
+    # Optional API key authentication
+    if API_KEY:
+        # Check for API key in query parameters
+        api_key = websocket.query_params.get("api_key")
+        if api_key != API_KEY:
+            await websocket.close(code=1008, reason="Invalid or missing API key")
+            print("Client connection rejected: Invalid API key")
+            return
+    
     # Accept the WebSocket connection
     await websocket.accept()
-    print("Client connected to /enhance")
+    client_host = websocket.client.host if websocket.client else "unknown"
+    print(f"Client connected from {client_host}")
     
     try:
         frame_count = 0
@@ -102,16 +139,16 @@ async def websocket_enhance(websocket: WebSocket):
                 await websocket.send_bytes(audio_bytes)
             
     except WebSocketDisconnect:
-        print(f"Client disconnected from /enhance (processed {frame_count} frames)")
+        print(f"Client from {client_host} disconnected (processed {frame_count} frames)")
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        print(f"WebSocket error from {client_host}: {e}")
     finally:
         # Ensure WebSocket is closed gracefully
         try:
             await websocket.close()
         except:
             pass  # Already closed
-        print("WebSocket connection closed")
+        print(f"WebSocket connection closed from {client_host}")
 
 
 if __name__ == "__main__":
