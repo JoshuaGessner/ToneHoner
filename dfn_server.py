@@ -13,13 +13,13 @@ import torch
 
 def install_deepfilternet():
     """
-    Install DeepFilterNet from GitHub repository.
+    Install DeepFilterNet from PyPI.
     """
-    print("Installing DeepFilterNet from GitHub...")
+    print("Installing DeepFilterNet from PyPI...")
     try:
         subprocess.check_call([
             sys.executable, "-m", "pip", "install", 
-            "git+https://github.com/Rikorose/DeepFilterNet.git"
+            "deepfilternet"
         ])
         print("DeepFilterNet installed successfully!")
     except subprocess.CalledProcessError as e:

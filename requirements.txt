@@ -10,5 +10,8 @@ websockets>=13.1
 # PyTorch for deep learning and model inference
 torch>=2.5.0
 
+# TorchAudio for audio processing utilities
+torchaudio>=2.5.0
+
 # NumPy for audio data manipulation and conversion
 numpy>=2.1.0
