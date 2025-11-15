@@ -192,7 +192,8 @@ def load_deepfilternet_for_inference():
         _model, _df_state, _ = init_df(
             model_base_dir=None,
             post_filter=True,
-            log_level="WARNING"  # Reduce verbosity
+            log_level="WARNING",  # Reduce verbosity
+            config_allow_defaults=True  # Allow default config
         )
         _model = _model.to(_device)
         _model.eval()
@@ -246,10 +247,15 @@ def enhance_block(audio: torch.Tensor) -> torch.Tensor:
     if audio.dtype != torch.float32:
         audio = audio.float()
     
-    # Check value range
+    # Check value range and normalize if needed
     audio_min, audio_max = audio.min().item(), audio.max().item()
     if audio_min < -1.0 or audio_max > 1.0:
-        print(f"Warning: Audio values outside [-1, 1] range: [{audio_min:.3f}, {audio_max:.3f}]")
+        print(f"Warning: Audio values outside [-1, 1] range: [{audio_min:.3f}, {audio_max:.3f}]. Clipping...")
+        audio = torch.clamp(audio, -1.0, 1.0)
+    
+    # Ensure audio is on CPU before sending to model (will move to device inside)
+    if audio.device.type != 'cpu':
+        audio = audio.cpu()
     
     try:
         # Start profiling
@@ -264,7 +270,8 @@ def enhance_block(audio: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             enhanced = _enhance_fn(_model, _df_state, audio_input.unsqueeze(0).to(_device))
             # enhanced shape is (batch, channels, samples), squeeze to (samples,)
-            enhanced = enhanced.squeeze(0).squeeze(0).cpu()
+            # Ensure we move to CPU and detach before any further operations
+            enhanced = enhanced.squeeze(0).squeeze(0).detach().cpu()
         
         # Ensure output matches input length
         if enhanced.shape[0] != num_samples:

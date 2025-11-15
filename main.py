@@ -118,8 +118,11 @@ async def websocket_enhance(websocket: WebSocket):
                 # Step 4: Enhance the audio using DeepFilterNet
                 enhanced_tensor = enhance_block(audio_tensor)
                 
-                # Step 5: Convert back to numpy float32
-                enhanced_float32 = enhanced_tensor.numpy()
+                # Step 5: Convert back to numpy float32 (ensure on CPU)
+                if isinstance(enhanced_tensor, torch.Tensor):
+                    enhanced_float32 = enhanced_tensor.detach().cpu().numpy().astype(np.float32)
+                else:
+                    enhanced_float32 = np.asarray(enhanced_tensor, dtype=np.float32)
                 
                 # Step 6: Clip to [-1.0, 1.0] range to prevent overflow
                 enhanced_float32 = np.clip(enhanced_float32, -1.0, 1.0)

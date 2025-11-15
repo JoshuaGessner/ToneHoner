@@ -67,6 +67,34 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import wave
 from pathlib import Path
+from fractions import Fraction
+try:
+    from scipy.signal import resample_poly  # type: ignore
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
+
+def _resample_audio(x: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Resample 1-D audio using scipy if available, else numpy interp.
+    Returns int16 array.
+    """
+    if orig_sr == target_sr:
+        return x.astype(np.int16)
+    if _HAS_SCIPY:
+        ratio = Fraction(target_sr, orig_sr).limit_denominator(1000)
+        up, down = ratio.numerator, ratio.denominator
+        y = resample_poly(x.astype(np.float32), up, down)
+        return np.clip(y, -32768, 32767).astype(np.int16)
+    # Fallback: linear interpolation
+    n = x.shape[0]
+    duration = n / float(orig_sr)
+    new_n = int(round(duration * target_sr))
+    if new_n <= 1 or n <= 1:
+        return x.astype(np.int16)
+    t_old = np.linspace(0.0, duration, num=n, endpoint=False, dtype=np.float64)
+    t_new = np.linspace(0.0, duration, num=new_n, endpoint=False, dtype=np.float64)
+    y = np.interp(t_new, t_old, x.astype(np.float32))
+    return np.clip(y, -32768, 32767).astype(np.int16)
 
 # Audio configuration
 SAMPLE_RATE = 48000  # Hz - DeepFilterNet expects 48kHz
@@ -287,13 +315,19 @@ async def process_audio_file(input_file: str, output_file: str, server_url: str)
                 print(f"Error: Only mono or stereo files are supported (got {num_channels} channels)")
                 return False
             
-            duration_sec = num_frames / sample_rate
+            duration_sec = len(audio_data) / sample_rate
             print(f"✓ Loaded: {num_frames} samples, {sample_rate}Hz, {num_channels} channel(s), {duration_sec:.2f}s")
             
-            # Warn if sample rate doesn't match
-            if sample_rate != SAMPLE_RATE:
-                print(f"⚠ Warning: Sample rate is {sample_rate}Hz, server expects {SAMPLE_RATE}Hz")
-                print(f"  Audio will be processed as-is, but quality may be affected.")
+            # Resample to model SR (48k) for best quality
+            orig_sr = sample_rate
+            if orig_sr != SAMPLE_RATE:
+                print(f"Resampling from {orig_sr} Hz to {SAMPLE_RATE} Hz for processing...")
+                audio_data = _resample_audio(audio_data, orig_sr, SAMPLE_RATE)
+                sample_rate = SAMPLE_RATE
+                print(f"✓ Resampled length: {len(audio_data)} samples")
+
+            # Store reference RMS at processing SR for gentle gain matching later
+            input_rms_ref = float(np.sqrt(np.mean(audio_data.astype(np.float32)**2) + 1e-12))
     
     except FileNotFoundError:
         print(f"Error: Input file not found: {input_file}")
@@ -310,41 +344,59 @@ async def process_audio_file(input_file: str, output_file: str, server_url: str)
         async with websockets.connect(server_url) as websocket:
             print("✓ Connected to server")
             
-            # Split audio into blocks
-            block_size = BLOCK_SIZE
-            num_blocks = (len(audio_data) + block_size - 1) // block_size
-            
-            print(f"\nProcessing {num_blocks} blocks...")
-            
+            # For file processing, use larger blocks with overlap-add crossfade
+            proc_block = SAMPLE_RATE  # 1 second blocks at 48k
+            xfade = 1024             # samples overlap for crossfade
+            if xfade >= proc_block:
+                xfade = proc_block // 4
+
+            num_blocks = (len(audio_data) + proc_block - 1) // proc_block
+            print(f"\nProcessing {num_blocks} blocks (block={proc_block}, xfade={xfade})...")
+
+            prev_tail = None
+            win = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(xfade) / (xfade - 1))  # Hann window
+
+            out_accum = []
             for i in range(num_blocks):
-                start_idx = i * block_size
-                end_idx = min(start_idx + block_size, len(audio_data))
-                
-                # Get audio block
+                start_idx = i * proc_block
+                end_idx = min(start_idx + proc_block, len(audio_data))
+
+                # Extract and pad to full block
                 audio_block = audio_data[start_idx:end_idx]
-                
-                # Pad if necessary (last block might be shorter)
-                if len(audio_block) < block_size:
-                    audio_block = np.pad(
-                        audio_block,
-                        (0, block_size - len(audio_block)),
-                        mode='constant'
-                    )
-                
+                if len(audio_block) < proc_block:
+                    audio_block = np.pad(audio_block, (0, proc_block - len(audio_block)), mode='constant')
+
                 # Send block
-                audio_bytes_block = audio_block.astype(np.int16).tobytes()
-                await websocket.send(audio_bytes_block)
-                
+                await websocket.send(audio_block.astype(np.int16).tobytes())
+
                 # Receive enhanced block
                 enhanced_bytes = await websocket.recv()
                 enhanced_block = np.frombuffer(enhanced_bytes, dtype=np.int16)
-                enhanced_blocks.append(enhanced_block)
-                
+
+                # Crossfade with previous tail if available
+                if prev_tail is None:
+                    out_accum.append(enhanced_block[:-xfade])
+                    prev_tail = enhanced_block[-xfade:]
+                else:
+                    head = enhanced_block[:xfade]
+                    tail = enhanced_block[xfade:-xfade]
+                    # Apply symmetric crossfade
+                    mixed = (prev_tail * (1.0 - win) + head * win).astype(np.int16)
+                    out_accum.append(mixed)
+                    out_accum.append(tail)
+                    prev_tail = enhanced_block[-xfade:]
+
                 # Progress indicator
-                if (i + 1) % 10 == 0 or (i + 1) == num_blocks:
+                if (i + 1) % 5 == 0 or (i + 1) == num_blocks:
                     progress = (i + 1) / num_blocks * 100
                     print(f"  Progress: {i + 1}/{num_blocks} blocks ({progress:.1f}%)")
-            
+
+            # Append last tail
+            if prev_tail is not None:
+                out_accum.append(prev_tail)
+
+            # Concatenate all parts
+            enhanced_blocks = out_accum
             print(f"✓ Processed all {num_blocks} blocks")
     
     except Exception as e:
@@ -355,16 +407,43 @@ async def process_audio_file(input_file: str, output_file: str, server_url: str)
     print("\nAssembling output...")
     enhanced_audio = np.concatenate(enhanced_blocks)
     
-    # Trim to original length (remove padding)
+    # Trim to processed-length before any resample back
     enhanced_audio = enhanced_audio[:len(audio_data)]
-    
+
+    # Optional: match output RMS to input RMS to avoid loudness drop (do at processing SR)
+    def _rms(x):
+        x = x.astype(np.float32)
+        return np.sqrt(np.mean(x * x) + 1e-12)
+
+    try:
+        in_rms = input_rms_ref if 'input_rms_ref' in locals() else _rms(enhanced_audio)
+        out_rms = _rms(enhanced_audio)
+        if out_rms > 0 and in_rms > 0:
+            gain = np.clip(in_rms / out_rms, 0.5, 2.0)
+            enhanced_audio = np.clip(enhanced_audio.astype(np.float32) * gain, -32768, 32767).astype(np.int16)
+            print(f"Applied output gain: {gain:.2f}x to match input RMS")
+    except Exception:
+        pass
+
+    # If we resampled to 48k, convert back to original SR
+    try:
+        if 'orig_sr' in locals() and orig_sr != sample_rate:
+            print(f"Resampling enhanced audio back to {orig_sr} Hz...")
+            enhanced_audio = _resample_audio(enhanced_audio, sample_rate, orig_sr)
+            out_sr = orig_sr
+        else:
+            out_sr = sample_rate
+    except Exception as e:
+        print(f"Warning: Resample back failed ({e}), keeping {sample_rate} Hz")
+        out_sr = sample_rate
+
     # Write output WAV file
     print(f"Writing output file: {output_file}")
     try:
         with wave.open(output_file, 'wb') as wav_out:
             wav_out.setnchannels(1)  # Mono
             wav_out.setsampwidth(2)  # 16-bit
-            wav_out.setframerate(sample_rate)
+            wav_out.setframerate(out_sr)
             wav_out.writeframes(enhanced_audio.tobytes())
         
         output_size = Path(output_file).stat().st_size / 1024 / 1024

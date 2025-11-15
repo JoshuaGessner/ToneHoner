@@ -50,3 +50,5 @@ client/dist/
 
 ToneHoner.code-workspace
 .python-version
+test_noisy.wav
+test_clean.wav
