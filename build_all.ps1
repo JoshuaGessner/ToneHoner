@@ -54,6 +54,26 @@ if (-not (Test-Command "pyinstaller")) {
     pip install pyinstaller
 }
 
+# Ensure Pillow is available for icon/banner generation
+try {
+    python - << 'PYCODE'
+import sys
+try:
+    import PIL  # noqa: F401
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PYCODE
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[X] Pillow not found. Installing..." -ForegroundColor Red
+        pip install Pillow
+    }
+} catch {
+    # Attempt pip install as fallback
+    Write-Host "[!] Could not verify Pillow. Attempting install..." -ForegroundColor Yellow
+    pip install Pillow
+}
+
 $global:IsccPath = Find-ISCC
 if (-not $global:IsccPath -and -not $SkipInstallers) {
     Write-Host "[X] Inno Setup Compiler (iscc) not found." -ForegroundColor Red
@@ -67,11 +87,20 @@ if (-not $global:IsccPath -and -not $SkipInstallers) {
 Write-Host "[OK] Prerequisites checked" -ForegroundColor Green
 Write-Host ""
 
-# Check if icons exist
-if (-not (Test-Path "client_icon.ico") -or -not (Test-Path "server_icon.ico")) {
-    Write-Host "Generating icons..." -ForegroundColor Yellow
+# Ensure all branding assets exist (icons + wizard images). Regenerate if any missing.
+$brandingFiles = @(
+    "client_icon.ico", "server_icon.ico", "installer_icon.ico",
+    "client_icon.png", "server_icon.png", "installer_icon.png",
+    "installer_wizard_large.bmp", "installer_wizard_small.bmp",
+    "installer_wizard_client_large.bmp", "installer_wizard_client_small.bmp",
+    "installer_wizard_server_large.bmp", "installer_wizard_server_small.bmp"
+)
+$missingBranding = $false
+foreach ($f in $brandingFiles) { if (-not (Test-Path $f)) { $missingBranding = $true } }
+if ($missingBranding) {
+    Write-Host "Generating branding assets (icons + wizard images)..." -ForegroundColor Yellow
     python generate_icons.py
-    Write-Host "[OK] Icons generated" -ForegroundColor Green
+    Write-Host "[OK] Branding assets generated" -ForegroundColor Green
     Write-Host ""
 }
 

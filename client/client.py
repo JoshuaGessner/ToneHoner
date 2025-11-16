@@ -1024,6 +1024,27 @@ def launch_gui():
 
     root = tk.Tk()
     root.title("ToneHoner Client - Audio Enhancement")
+    # Try to set custom window icon
+    try:
+        icon_path_candidates = []
+        # client.py lives in client/, icons are at repo root by default
+        base_dir = os.path.abspath(os.path.dirname(__file__))
+        icon_path_candidates.append(os.path.abspath(os.path.join(base_dir, '..', 'client_icon.ico')))
+        icon_path_candidates.append(os.path.join(os.getcwd(), 'client_icon.ico'))
+        # If bundled by PyInstaller, files may be in _MEIPASS
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            icon_path_candidates.append(os.path.join(sys._MEIPASS, 'client_icon.ico'))  # type: ignore
+        icon_file = next((p for p in icon_path_candidates if os.path.exists(p)), None)
+        if icon_file and os.name == 'nt':
+            root.iconbitmap(icon_file)
+        elif icon_file:
+            try:
+                from tkinter import PhotoImage
+                root.iconphoto(True, PhotoImage(file=icon_file))
+            except Exception:
+                pass
+    except Exception:
+        pass
     
     # Get screen dimensions and calculate appropriate window size
     screen_width = root.winfo_screenwidth()

@@ -110,6 +110,26 @@ class ServerGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("ToneHoner Server Console")
+        # Try to set custom window icon (Windows shows Tk feather by default)
+        try:
+            icon_path_candidates = []
+            base_dir = os.path.abspath(os.path.dirname(__file__))
+            icon_path_candidates.append(os.path.join(base_dir, 'server_icon.ico'))
+            icon_path_candidates.append(os.path.join(os.getcwd(), 'server_icon.ico'))
+            # If bundled by PyInstaller, files may be in _MEIPASS
+            if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+                icon_path_candidates.append(os.path.join(sys._MEIPASS, 'server_icon.ico'))  # type: ignore
+            icon_file = next((p for p in icon_path_candidates if os.path.exists(p)), None)
+            if icon_file and os.name == 'nt':
+                self.root.iconbitmap(icon_file)
+            elif icon_file:
+                try:
+                    from tkinter import PhotoImage
+                    self.root.iconphoto(True, PhotoImage(file=icon_file))
+                except Exception:
+                    pass
+        except Exception:
+            pass
         
         # Get screen dimensions and calculate appropriate window size
         screen_width = self.root.winfo_screenwidth()
