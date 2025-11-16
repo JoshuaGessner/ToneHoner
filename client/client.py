@@ -519,8 +519,8 @@ def get_default_presets() -> dict:
         "Subtle": {
             "input_gain": 1.0,
             "output_gain": 1.0,
-            "mix": 0.5,
-            "noise_gate": -70.0,
+            "mix": 0.7,
+            "noise_gate": -65.0,
             "pass_through": False
         },
         "Aggressive": {

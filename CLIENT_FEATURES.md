@@ -121,9 +121,9 @@ Located in the "Advanced Settings" tab:
 ### Subtle
 - Input Gain: 1.0x
 - Output Gain: 1.0x
-- Mix: 50% wet
-- Noise Gate: -70 dB
-- Gentle enhancement, natural sound
+- Mix: 70% wet
+- Noise Gate: -65 dB
+- Gentle enhancement, cleaner tone with reduced reverb
 
 ### Aggressive
 - Input Gain: 1.8x
