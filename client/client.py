@@ -68,6 +68,7 @@ from tkinter import ttk, messagebox, filedialog
 import wave
 from pathlib import Path
 from fractions import Fraction
+import struct
 try:
     from scipy.signal import resample_poly  # type: ignore
     _HAS_SCIPY = True
@@ -98,7 +99,8 @@ def _resample_audio(x: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
 
 # Audio configuration
 SAMPLE_RATE = 48000  # Hz - DeepFilterNet expects 48kHz
-BLOCK_SIZE = 4800    # samples - 100ms blocks (48000 * 0.1)
+# Reduced block size for lower algorithmic latency (20ms @ 48kHz = 960 samples)
+BLOCK_SIZE = 960     # samples ~20ms
 CHANNELS = 1         # mono audio
 DTYPE = np.int16     # 16-bit PCM
 
@@ -114,8 +116,8 @@ OUTPUT_DEVICE = None  # Virtual audio device output index (e.g., 4 for VB-Cable,
 SERVER_URL = "ws://localhost:8000/enhance"
 
 # Thread-safe queues for audio data
-input_queue = Queue(maxsize=10)   # Captured audio blocks
-output_queue = Queue(maxsize=10)  # Enhanced audio blocks
+input_queue = Queue(maxsize=32)   # Captured audio blocks (larger to absorb jitter)
+output_queue = Queue(maxsize=32)  # Enhanced audio blocks
 
 # Control flags
 running = True
@@ -123,8 +125,14 @@ stats_lock = threading.Lock()
 stats = {
     "blocks_sent": 0,
     "blocks_received": 0,
-    "errors": 0
+    "errors": 0,
+    "avg_latency_ms": 0.0,
+    "last_latency_ms": 0.0
 }
+
+# Connection status for audio callback control
+ws_connected = threading.Event()
+_last_queue_warn = 0.0
 
 
 def audio_callback(indata, outdata, frames, time_info, status):
@@ -148,14 +156,21 @@ def audio_callback(indata, outdata, frames, time_info, status):
         return
     
     try:
-        # Copy input audio to queue (non-blocking)
-        # Convert to 1D array and copy to avoid reference issues
-        audio_block = indata[:, 0].copy() if indata.ndim > 1 else indata.copy()
-        
-        if not input_queue.full():
-            input_queue.put(audio_block)
-        else:
-            print("Warning: Input queue full, dropping audio block")
+        # If websocket is not connected, do not enqueue input (avoid backpressure)
+        if ws_connected.is_set():
+            # Copy input audio to queue (non-blocking)
+            # Convert to 1D array and copy to avoid reference issues
+            audio_block = indata[:, 0].copy() if indata.ndim > 1 else indata.copy()
+            if not input_queue.full():
+                input_queue.put(audio_block)
+            else:
+                # Rate-limit warnings to ~1/sec
+                global _last_queue_warn
+                import time as _time
+                now = _time.time()
+                if now - _last_queue_warn > 1.0:
+                    print("Warning: Input queue full, dropping audio block")
+                    _last_queue_warn = now
         
         # Get enhanced audio from output queue
         if not output_queue.empty():
@@ -179,67 +194,103 @@ def audio_callback(indata, outdata, frames, time_info, status):
 
 
 async def websocket_handler():
-    """
-    Async WebSocket handler that sends captured audio to the server
-    and receives enhanced audio back.
-    
-    Runs in the asyncio event loop.
-    """
+    """Manage WebSocket connection with reconnection and split send/recv tasks."""
     global running, stats
-    
-    print(f"Connecting to WebSocket server: {SERVER_URL}")
-    
-    try:
-        async with websockets.connect(SERVER_URL) as websocket:
-            print("✓ Connected to enhancement server")
-            
-            while running:
-                try:
-                    # Get audio block from input queue (non-blocking with timeout)
-                    try:
-                        audio_block = await asyncio.get_event_loop().run_in_executor(
-                            None, input_queue.get, True, 0.1
-                        )
-                    except:
-                        # Queue timeout, continue loop
-                        continue
-                    
-                    # Convert numpy array to bytes (int16)
-                    audio_bytes = audio_block.astype(np.int16).tobytes()
-                    
-                    # Send to server
-                    await websocket.send(audio_bytes)
-                    with stats_lock:
-                        stats["blocks_sent"] += 1
-                    
-                    # Receive enhanced audio from server
-                    enhanced_bytes = await websocket.recv()
-                    
-                    # Convert bytes back to numpy array
-                    enhanced_block = np.frombuffer(enhanced_bytes, dtype=np.int16)
-                    
-                    # Put enhanced audio in output queue
-                    if not output_queue.full():
-                        output_queue.put(enhanced_block)
-                        with stats_lock:
-                            stats["blocks_received"] += 1
-                    else:
-                        print("Warning: Output queue full, dropping enhanced block")
-                    
-                except websockets.exceptions.ConnectionClosed:
-                    print("WebSocket connection closed by server")
-                    running = False
-                    break
-                except Exception as e:
-                    print(f"Error in WebSocket handler: {e}")
-                    with stats_lock:
-                        stats["errors"] += 1
-                    await asyncio.sleep(0.1)
-    
-    except Exception as e:
-        print(f"Failed to connect to WebSocket server: {e}")
-        print("Make sure the server is running on localhost:8000")
-        running = False
+    backoff = 1.0
+    seq = 0
+    MAGIC = b"THv1"
+    while running:
+        print(f"Connecting to WebSocket server: {SERVER_URL}")
+        try:
+            async with websockets.connect(
+                SERVER_URL,
+                open_timeout=3,
+                close_timeout=1,
+                ping_interval=20,
+                ping_timeout=20,
+            ) as websocket:
+                print("✓ Connected to enhancement server")
+                ws_connected.set()
+                backoff = 1.0  # reset on success
+
+                async def sender():
+                    loop = asyncio.get_event_loop()
+                    while running and ws_connected.is_set():
+                        try:
+                            audio_block = await loop.run_in_executor(None, input_queue.get, True, 0.1)
+                        except Exception:
+                            continue
+                        try:
+                            nonlocal seq
+                            audio_bytes = audio_block.astype(np.int16).tobytes()
+                            t_send_ms = float(loop.time() * 1000.0)
+                            header = MAGIC + struct.pack("<I", seq) + struct.pack("<d", t_send_ms)
+                            await websocket.send(header + audio_bytes)
+                            seq = (seq + 1) & 0xFFFFFFFF
+                            with stats_lock:
+                                stats["blocks_sent"] += 1
+                        except Exception:
+                            with stats_lock:
+                                stats["errors"] += 1
+                            await asyncio.sleep(0.01)
+
+                async def receiver():
+                    loop = asyncio.get_event_loop()
+                    lat_samples = []
+                    while running and ws_connected.is_set():
+                        try:
+                            enhanced_bytes = await websocket.recv()
+                            if isinstance(enhanced_bytes, (bytes, bytearray)) and len(enhanced_bytes) >= 16 and enhanced_bytes[:4] == MAGIC:
+                                r_seq = struct.unpack_from("<I", enhanced_bytes, 4)[0]
+                                t_send_ms = struct.unpack_from("<d", enhanced_bytes, 8)[0]
+                                pcm_bytes = enhanced_bytes[16:]
+                                now_ms = float(loop.time() * 1000.0)
+                                latency = max(0.0, now_ms - t_send_ms)
+                                lat_samples.append(latency)
+                                if len(lat_samples) > 200:
+                                    lat_samples.pop(0)
+                                with stats_lock:
+                                    stats["last_latency_ms"] = latency
+                                    stats["avg_latency_ms"] = float(sum(lat_samples) / len(lat_samples))
+                            else:
+                                pcm_bytes = enhanced_bytes
+                            enhanced_block = np.frombuffer(pcm_bytes, dtype=np.int16)
+                            if not output_queue.full():
+                                output_queue.put(enhanced_block)
+                                with stats_lock:
+                                    stats["blocks_received"] += 1
+                            else:
+                                try:
+                                    _ = output_queue.get_nowait()
+                                    output_queue.put(enhanced_block)
+                                except Exception:
+                                    pass
+                        except websockets.exceptions.ConnectionClosed:
+                            print("WebSocket connection closed by server")
+                            break
+                        except Exception:
+                            with stats_lock:
+                                stats["errors"] += 1
+                            await asyncio.sleep(0.01)
+
+                send_task = asyncio.create_task(sender())
+                recv_task = asyncio.create_task(receiver())
+                await asyncio.wait({send_task, recv_task}, return_when=asyncio.FIRST_EXCEPTION)
+        except Exception as e:
+            print(f"Failed to connect to WebSocket server: {e}")
+            print("If remote, ensure the server is reachable and use wss:// behind TLS.")
+        finally:
+            ws_connected.clear()
+            # Drain queues to prevent stale buildup
+            try:
+                while not input_queue.empty():
+                    input_queue.get_nowait()
+            except Exception:
+                pass
+            # Exponential backoff up to 10s
+            if running:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
 
 
 async def stats_reporter():
@@ -255,6 +306,8 @@ async def stats_reporter():
             print(f"Blocks sent: {stats['blocks_sent']}")
             print(f"Blocks received: {stats['blocks_received']}")
             print(f"Errors: {stats['errors']}")
+            print(f"Avg latency: {stats.get('avg_latency_ms', 0.0):.1f} ms")
+            print(f"Last latency: {stats.get('last_latency_ms', 0.0):.1f} ms")
             print(f"Input queue size: {input_queue.qsize()}")
             print(f"Output queue size: {output_queue.qsize()}")
             print("-------------\n")
@@ -506,10 +559,13 @@ def main():
         default=OUTPUT_DEVICE,
         help="Output device index (default: system default)"
     )
+    # Default to GUI when running as a frozen (packaged) executable
+    default_gui = bool(getattr(sys, 'frozen', False))
     parser.add_argument(
         "--gui",
         action="store_true",
-        help="Launch GUI for device selection and control"
+        default=default_gui,
+        help="Launch GUI for device selection and control (default in packaged exe)"
     )
     parser.add_argument(
         "--file",

@@ -1,6 +1,6 @@
 # Packaging Instructions
 
-This guide explains how to package the DeepFilterNet client into a standalone executable for distribution on Windows, macOS, and Linux.
+This guide explains how to package the ToneHoner Server (GUI) and Client into standalone executables. Windows PowerShell examples are provided; macOS/Linux notes remain below.
 
 ## Prerequisites
 
@@ -14,19 +14,45 @@ pip install pyinstaller
 
 ## Windows
 
-### Build Single Executable
+### Build Both Executables (recommended)
+
+Use the provided PowerShell script which builds using the included `.spec` files and collects required package data (torch, torchaudio, df, fastapi, starlette, websockets, sounddevice, numpy, etc.).
+
+```powershell
+# From repo root, with your venv activated
+python -m pip install -r .\requirements.txt
+python -m pip install pyinstaller
+
+./build_executables.ps1
+
+# Outputs:
+# dist/ToneHoner-Server.exe  (Server GUI; no console)
+# dist/ToneHoner-Client.exe  (Client GUI; no console)
+```
+
+Notes:
+- First run may take a while due to torch packaging.
+- Startup of onefile torch apps can be slower; subsequent runs are faster.
+
+### Build Client Single Executable (manual alternative)
 
 ```powershell
 # Navigate to the client directory
 cd client
 
 # Create single-file executable
-pyinstaller --onefile --name "DeepFilterNet-Client" client.py
+pyinstaller --onefile --noconsole --name "ToneHoner-Client" client/client.py
 
 # The executable will be in: dist\DeepFilterNet-Client.exe
 ```
 
-### Build GUI Executable (No Console)
+### Build Server GUI (manual alternative)
+
+```powershell
+pyinstaller --onefile --noconsole --name "ToneHoner-Server" server_gui.py
+```
+
+This is simpler but may miss some dynamic dependencies. Prefer the provided `tonehoner_server.spec` and `tonehoner_client.spec` which use `collect_all()` for deep dependencies.
 
 ```powershell
 pyinstaller --onefile --noconsole --name "DeepFilterNet-Client" client.py
@@ -101,17 +127,17 @@ choco install nsis -y
 # Navigate to the client directory
 cd client
 
-# Create single-file executable
+# Create single-file executable (client)
 pyinstaller --onefile --name "deepfilternet-client" client.py
 
 # The executable will be in: dist/deepfilternet-client
 ```
 
-### Build macOS Application Bundle (.app)
+### Build macOS Application Bundle (.app) for Server GUI
 
 ```bash
 # Create .app bundle with windowed mode
-pyinstaller --onefile --windowed --name "DeepFilterNet Client" client.py
+pyinstaller --onefile --windowed --name "ToneHoner Server" server_gui.py
 
 # The .app will be in: dist/DeepFilterNet Client.app
 ```
@@ -427,7 +453,19 @@ pyinstaller --onefile \
   client.py
 ```
 
-### Spec File for Advanced Configuration
+### Spec Files (included)
+
+We ship two spec files tailored for this project:
+
+- `tonehoner_server.spec`: bundles `server_gui.py` with FastAPI/Uvicorn/torch/DeepFilterNet assets.
+- `tonehoner_client.spec`: bundles `client/client.py` with sounddevice/websockets/numpy.
+
+Build them with:
+
+```powershell
+python -m PyInstaller -y .\tonehoner_server.spec
+python -m PyInstaller -y .\tonehoner_client.spec
+```
 
 Create a custom `.spec` file for reproducible builds:
 
@@ -441,7 +479,7 @@ pyinstaller --onefile client.py --name deepfilternet-client
 pyinstaller deepfilternet-client.spec
 ```
 
-Example `.spec` file modifications:
+Example `.spec` file modifications (generic):
 ```python
 # deepfilternet-client.spec
 a = Analysis(

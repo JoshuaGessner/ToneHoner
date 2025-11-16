@@ -83,6 +83,7 @@ _model = None
 _df_state = None
 _device = None
 _enhance_fn = None
+_use_fp16 = False
 
 
 def unload_model():
@@ -172,7 +173,7 @@ def load_deepfilternet_for_inference():
     Returns:
         Tuple of (model, df_state, device)
     """
-    global _model, _df_state, _device, _enhance_fn
+    global _model, _df_state, _device, _enhance_fn, _use_fp16
     
     print("Loading DeepFilterNet model for inference...")
     
@@ -201,6 +202,25 @@ def load_deepfilternet_for_inference():
         # Store the enhance function
         _enhance_fn = enhance
         
+        # Optional FP16 toggle for GPU to reduce latency
+        _use_fp16 = False
+        try:
+            fp16_env = os.getenv("TONEHONER_FP16", "0").lower()
+            want_fp16 = fp16_env in ("1", "true", "yes", "on")
+            if want_fp16 and _device.type == "cuda":
+                _model.half()
+                # Quick sanity warm-up to validate precision mode
+                import torch as _torch
+                test = _torch.zeros(960, dtype=_torch.float32).unsqueeze(0)
+                _ = _enhance_fn(_model, _df_state, test)
+                _use_fp16 = True
+                print("FP16 enabled for model weights (TONEHONER_FP16=1)")
+        except Exception as e:
+            # Revert to float32 on any error
+            _model.float()
+            _use_fp16 = False
+            print(f"FP16 not enabled (fallback to fp32): {e}")
+
         load_time = time.time() - start_time
         print(f"Model loaded successfully in {load_time:.3f} seconds")
         print(f"Device: {_device}")
@@ -306,9 +326,14 @@ def enhance_block(audio: torch.Tensor) -> torch.Tensor:
         duration_sec = num_samples / _df_state.sr()
         rtf = inference_time / duration_sec if duration_sec > 0 else 0
         
-        if num_samples > 1000:  # Only print for non-trivial blocks
-            print(f"Inference: {num_samples} samples ({duration_sec:.3f}s audio) "
-                  f"processed in {inference_time:.3f}s (RTF: {rtf:.3f}x)")
+        # Very light periodic debug print guarded by env variable
+        try:
+            if os.getenv("TONEHONER_DEBUG_RTF", "0") in ("1", "true", "yes", "on"):
+                # Only print for blocks >= 20ms to avoid noise
+                if num_samples >= 960:
+                    print(f"Inference: {num_samples} samples ({duration_sec:.3f}s) -> {inference_time*1000:.1f} ms, RTF={rtf:.3f}")
+        except Exception:
+            pass
         
         return enhanced
         
