@@ -55,22 +55,9 @@ if (-not (Test-Command "pyinstaller")) {
 }
 
 # Ensure Pillow is available for icon/banner generation
-try {
-    python - << 'PYCODE'
-import sys
-try:
-    import PIL  # noqa: F401
-    sys.exit(0)
-except Exception:
-    sys.exit(1)
-PYCODE
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[X] Pillow not found. Installing..." -ForegroundColor Red
-        pip install Pillow
-    }
-} catch {
-    # Attempt pip install as fallback
-    Write-Host "[!] Could not verify Pillow. Attempting install..." -ForegroundColor Yellow
+$pillowCheck = python -c "import sys; import PIL; sys.exit(0)" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[X] Pillow not found. Installing..." -ForegroundColor Red
     pip install Pillow
 }
 
