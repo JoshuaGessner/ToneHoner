@@ -1,0 +1,117 @@
+; ToneHoner Server - Inno Setup Script
+; This script creates an installer for the ToneHoner Server application
+
+#define MyAppName "ToneHoner Server"
+#define MyAppVersion "1.0.0"
+#define MyAppPublisher "ToneHoner"
+#define MyAppURL "https://github.com/JoshuaGessner/ToneHoner"
+#define MyAppExeName "ToneHoner-Server.exe"
+
+[Setup]
+; NOTE: The value of AppId uniquely identifies this application.
+AppId={{F6E5D4C3-B2A1-9E8D-7C6B-5A4F3E2D1C0B}
+AppName={#MyAppName}
+AppVersion={#MyAppVersion}
+AppVerName={#MyAppName} {#MyAppVersion}
+AppPublisher={#MyAppPublisher}
+AppPublisherURL={#MyAppURL}
+AppSupportURL={#MyAppURL}
+AppUpdatesURL={#MyAppURL}
+DefaultDirName={autopf}\{#MyAppName}
+DefaultGroupName={#MyAppName}
+DisableProgramGroupPage=yes
+LicenseFile=
+OutputDir=dist\installers
+OutputBaseFilename=ToneHoner-Server-Setup-{#MyAppVersion}
+SetupIconFile=server_icon.ico
+Compression=lzma
+SolidCompression=yes
+WizardStyle=modern
+PrivilegesRequired=admin
+ArchitecturesInstallIn64BitMode=x64compatible
+UninstallDisplayIcon={app}\{#MyAppExeName}
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "quicklaunchicon"; Description: "{cm:CreateQuickLaunchIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked; OnlyBelowVersion: 6.1; Check: not IsAdminInstallMode
+Name: "startupicon"; Description: "Run server at Windows startup"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+[Files]
+Source: "dist\ToneHoner-Server\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "models\*"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs
+; NOTE: Don't use "Flags: ignoreversion" on any shared system files
+
+[Icons]
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\README"; Filename: "{app}\README.md"
+Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startupicon
+Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: quicklaunchicon
+
+[Run]
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+function InitializeSetup(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := True;
+  
+  // Check if CUDA is available (optional but recommended)
+  if MsgBox('ToneHoner Server works best with NVIDIA GPU and CUDA support.' + #13#10#13#10 + 
+            'The server will work on CPU but may be slower.' + #13#10#13#10 +
+            'CUDA installation is recommended but optional.' + #13#10#13#10 +
+            'Would you like to continue with the installation?', mbConfirmation, MB_YESNO) = IDYES then
+  begin
+    Result := True;
+  end else
+  begin
+    Result := False;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    // Check if models directory exists and has content
+    if not FileExists(ExpandConstant('{app}\models\model_ts.pt')) then
+    begin
+      MsgBox('Warning: Model file not found.' + #13#10#13#10 +
+             'You will need to run the model export script before using the server.' + #13#10 +
+             'See README.md for instructions.', mbInformation, MB_OK);
+    end;
+    
+    // Ask if user wants to configure firewall
+    if MsgBox('Would you like to add a Windows Firewall rule to allow incoming connections on port 8000?' + #13#10#13#10 +
+              'This is required for clients to connect to the server.', mbConfirmation, MB_YESNO) = IDYES then
+    begin
+      Exec('netsh', 'advfirewall firewall add rule name="ToneHoner Server" dir=in action=allow protocol=TCP localport=8000', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    end;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    // Remove firewall rule
+    if MsgBox('Would you like to remove the Windows Firewall rule for ToneHoner Server?', mbConfirmation, MB_YESNO) = IDYES then
+    begin
+      Exec('netsh', 'advfirewall firewall delete rule name="ToneHoner Server"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    end;
+  end;
+end;
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}"
