@@ -55,8 +55,12 @@ if (-not (Test-Command "pyinstaller")) {
 }
 
 # Ensure Pillow is available for icon/banner generation
-$null = python -c "import PIL" 2>&1
-if ($LASTEXITCODE -ne 0) {
+try {
+    $null = python -c "import PIL" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw
+    }
+} catch {
     Write-Host "[X] Pillow not found. Installing..." -ForegroundColor Red
     pip install Pillow
 }
