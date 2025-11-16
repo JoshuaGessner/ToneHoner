@@ -69,6 +69,8 @@ import wave
 from pathlib import Path
 from fractions import Fraction
 import struct
+import json
+import os
 try:
     from scipy.signal import resample_poly  # type: ignore
     _HAS_SCIPY = True
@@ -96,6 +98,38 @@ def _resample_audio(x: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     t_new = np.linspace(0.0, duration, num=new_n, endpoint=False, dtype=np.float64)
     y = np.interp(t_new, t_old, x.astype(np.float32))
     return np.clip(y, -32768, 32767).astype(np.int16)
+
+
+def _calculate_db_level(audio_block: np.ndarray) -> float:
+    """Calculate audio level in dB from int16 samples."""
+    audio_float = audio_block.astype(np.float32) / 32768.0
+    rms = np.sqrt(np.mean(audio_float ** 2) + 1e-10)
+    db = 20.0 * np.log10(rms + 1e-10)
+    return float(db)
+
+
+def _apply_gain(audio_block: np.ndarray, gain: float) -> np.ndarray:
+    """Apply gain to int16 audio block with clipping."""
+    audio_float = audio_block.astype(np.float32) * gain
+    return np.clip(audio_float, -32768, 32767).astype(np.int16)
+
+
+def _apply_noise_gate(audio_block: np.ndarray, threshold_db: float) -> np.ndarray:
+    """Apply noise gate - silence audio below threshold."""
+    level_db = _calculate_db_level(audio_block)
+    if level_db < threshold_db:
+        return np.zeros_like(audio_block)
+    return audio_block
+
+
+def _mix_audio(dry: np.ndarray, wet: np.ndarray, mix: float) -> np.ndarray:
+    """Mix dry (original) and wet (processed) audio.
+    mix=0.0 is 100% dry, mix=1.0 is 100% wet.
+    """
+    dry_float = dry.astype(np.float32)
+    wet_float = wet.astype(np.float32)
+    mixed = dry_float * (1.0 - mix) + wet_float * mix
+    return np.clip(mixed, -32768, 32767).astype(np.int16)
 
 # Audio configuration
 SAMPLE_RATE = 48000  # Hz - DeepFilterNet expects 48kHz
@@ -134,6 +168,27 @@ stats = {
 ws_connected = threading.Event()
 _last_queue_warn = 0.0
 
+# Audio processing controls (thread-safe with locks)
+processing_lock = threading.Lock()
+processing_params = {
+    "input_gain": 1.0,      # Pre-processing gain multiplier (0.0 - 2.0)
+    "output_gain": 1.0,     # Post-processing gain multiplier (0.0 - 2.0)
+    "dry_wet_mix": 1.0,     # 0.0=dry (original), 1.0=wet (enhanced)
+    "pass_through": False,  # True=bypass enhancement entirely
+    "noise_gate_threshold": -60.0,  # dB threshold for noise gate (disabled if <= -100)
+    "enable_recording": False,      # Enable audio recording
+}
+
+# Audio level monitoring
+audio_levels = {
+    "input_level": -100.0,   # dB
+    "output_level": -100.0,  # dB
+}
+
+# Recording buffer
+recording_buffer = []
+recording_lock = threading.Lock()
+
 
 def audio_callback(indata, outdata, frames, time_info, status):
     """
@@ -156,35 +211,86 @@ def audio_callback(indata, outdata, frames, time_info, status):
         return
     
     try:
-        # If websocket is not connected, do not enqueue input (avoid backpressure)
-        if ws_connected.is_set():
-            # Copy input audio to queue (non-blocking)
-            # Convert to 1D array and copy to avoid reference issues
-            audio_block = indata[:, 0].copy() if indata.ndim > 1 else indata.copy()
-            if not input_queue.full():
-                input_queue.put(audio_block)
-            else:
-                # Rate-limit warnings to ~1/sec
-                global _last_queue_warn
-                import time as _time
-                now = _time.time()
-                if now - _last_queue_warn > 1.0:
-                    print("Warning: Input queue full, dropping audio block")
-                    _last_queue_warn = now
+        # Convert to 1D array and copy to avoid reference issues
+        audio_block = indata[:, 0].copy() if indata.ndim > 1 else indata.copy()
         
-        # Get enhanced audio from output queue
-        if not output_queue.empty():
-            enhanced_block = output_queue.get_nowait()
-            
-            # Ensure the block size matches
-            if len(enhanced_block) == frames:
-                outdata[:, 0] = enhanced_block
-            else:
-                print(f"Warning: Block size mismatch ({len(enhanced_block)} vs {frames})")
-                outdata.fill(0)
+        # Get current processing parameters (thread-safe)
+        with processing_lock:
+            input_gain = processing_params["input_gain"]
+            output_gain = processing_params["output_gain"]
+            dry_wet_mix = processing_params["dry_wet_mix"]
+            pass_through = processing_params["pass_through"]
+            noise_gate_threshold = processing_params["noise_gate_threshold"]
+            enable_recording = processing_params["enable_recording"]
+        
+        # Calculate and store input level
+        input_level = _calculate_db_level(audio_block)
+        audio_levels["input_level"] = input_level
+        
+        # Apply input gain
+        if input_gain != 1.0:
+            audio_block = _apply_gain(audio_block, input_gain)
+        
+        # Apply noise gate to input if enabled
+        if noise_gate_threshold > -100.0:
+            audio_block = _apply_noise_gate(audio_block, noise_gate_threshold)
+        
+        # Store original for dry/wet mixing
+        original_block = audio_block.copy()
+        
+        # If pass-through mode, skip enhancement
+        if pass_through:
+            output_block = audio_block
         else:
-            # No enhanced audio available yet, output silence
-            outdata.fill(0)
+            # If websocket is not connected, use original audio
+            if not ws_connected.is_set():
+                output_block = audio_block
+            else:
+                # Send to enhancement queue (non-blocking)
+                if not input_queue.full():
+                    input_queue.put(audio_block)
+                else:
+                    # Rate-limit warnings to ~1/sec
+                    global _last_queue_warn
+                    import time as _time
+                    now = _time.time()
+                    if now - _last_queue_warn > 1.0:
+                        print("Warning: Input queue full, dropping audio block")
+                        _last_queue_warn = now
+                
+                # Get enhanced audio from output queue
+                if not output_queue.empty():
+                    enhanced_block = output_queue.get_nowait()
+                    
+                    # Ensure the block size matches
+                    if len(enhanced_block) == frames:
+                        output_block = enhanced_block
+                    else:
+                        print(f"Warning: Block size mismatch ({len(enhanced_block)} vs {frames})")
+                        output_block = audio_block  # Fallback to original
+                else:
+                    # No enhanced audio available yet, use original
+                    output_block = audio_block
+        
+        # Apply dry/wet mix if not 100% wet
+        if dry_wet_mix < 1.0:
+            output_block = _mix_audio(original_block, output_block, dry_wet_mix)
+        
+        # Apply output gain
+        if output_gain != 1.0:
+            output_block = _apply_gain(output_block, output_gain)
+        
+        # Calculate and store output level
+        output_level = _calculate_db_level(output_block)
+        audio_levels["output_level"] = output_level
+        
+        # Send to output
+        outdata[:, 0] = output_block
+        
+        # Record if enabled
+        if enable_recording:
+            with recording_lock:
+                recording_buffer.append(output_block.copy())
             
     except Exception as e:
         print(f"Error in audio callback: {e}")
@@ -308,9 +414,123 @@ async def stats_reporter():
             print(f"Errors: {stats['errors']}")
             print(f"Avg latency: {stats.get('avg_latency_ms', 0.0):.1f} ms")
             print(f"Last latency: {stats.get('last_latency_ms', 0.0):.1f} ms")
-            print(f"Input queue size: {input_queue.qsize()}")
-            print(f"Output queue size: {output_queue.qsize()}")
+            print(f"Input queue: {input_queue.qsize()} | Output queue: {output_queue.qsize()}")
+            print(f"Input level: {audio_levels.get('input_level', -100):.1f} dB")
+            print(f"Output level: {audio_levels.get('output_level', -100):.1f} dB")
+            with processing_lock:
+                print(f"Input gain: {processing_params['input_gain']:.2f}x | Output gain: {processing_params['output_gain']:.2f}x")
+                print(f"Mix: {processing_params['dry_wet_mix']*100:.0f}% wet | Pass-through: {processing_params['pass_through']}")
             print("-------------\n")
+
+
+def start_recording():
+    """Start recording processed audio."""
+    global recording_buffer
+    with recording_lock:
+        recording_buffer = []
+    with processing_lock:
+        processing_params["enable_recording"] = True
+    print("Recording started...")
+
+
+def stop_recording() -> np.ndarray:
+    """Stop recording and return the recorded audio."""
+    with processing_lock:
+        processing_params["enable_recording"] = False
+    with recording_lock:
+        if recording_buffer:
+            recorded = np.concatenate(recording_buffer)
+            recording_buffer.clear()
+            print(f"Recording stopped. Captured {len(recorded)} samples.")
+            return recorded
+        else:
+            print("No audio recorded.")
+            return np.array([], dtype=np.int16)
+
+
+def save_recording(audio: np.ndarray, filename: str, sample_rate: int = SAMPLE_RATE):
+    """Save recorded audio to WAV file."""
+    try:
+        with wave.open(filename, 'wb') as wav_out:
+            wav_out.setnchannels(1)
+            wav_out.setsampwidth(2)
+            wav_out.setframerate(sample_rate)
+            wav_out.writeframes(audio.tobytes())
+        file_size = Path(filename).stat().st_size / 1024
+        duration = len(audio) / sample_rate
+        print(f"✓ Recording saved: {filename} ({file_size:.1f} KB, {duration:.1f}s)")
+        return True
+    except Exception as e:
+        print(f"✗ Error saving recording: {e}")
+        return False
+
+
+def get_presets_file_path() -> Path:
+    """Get the path to the user presets file."""
+    # Store in user's home directory
+    home = Path.home()
+    presets_dir = home / ".tonehoner"
+    presets_dir.mkdir(exist_ok=True)
+    return presets_dir / "presets.json"
+
+
+def load_custom_presets() -> dict:
+    """Load custom presets from JSON file."""
+    presets_file = get_presets_file_path()
+    if presets_file.exists():
+        try:
+            with open(presets_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load presets: {e}")
+            return {}
+    return {}
+
+
+def save_custom_presets(presets: dict) -> bool:
+    """Save custom presets to JSON file."""
+    presets_file = get_presets_file_path()
+    try:
+        with open(presets_file, 'w') as f:
+            json.dump(presets, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"Error saving presets: {e}")
+        return False
+
+
+def get_default_presets() -> dict:
+    """Get the built-in default presets."""
+    return {
+        "Default": {
+            "input_gain": 1.0,
+            "output_gain": 1.0,
+            "mix": 1.0,
+            "noise_gate": -60.0,
+            "pass_through": False
+        },
+        "Boost": {
+            "input_gain": 1.5,
+            "output_gain": 1.2,
+            "mix": 1.0,
+            "noise_gate": -50.0,
+            "pass_through": False
+        },
+        "Subtle": {
+            "input_gain": 1.0,
+            "output_gain": 1.0,
+            "mix": 0.5,
+            "noise_gate": -70.0,
+            "pass_through": False
+        },
+        "Aggressive": {
+            "input_gain": 1.8,
+            "output_gain": 1.5,
+            "mix": 1.0,
+            "noise_gate": -40.0,
+            "pass_through": False
+        },
+    }
 
 
 def list_audio_devices():
@@ -741,8 +961,37 @@ def launch_gui():
     controller = ClientController()
 
     root = tk.Tk()
-    root.title("ToneHoner Client")
-    root.geometry("600x450")
+    root.title("ToneHoner Client - Audio Enhancement")
+    
+    # Get screen dimensions and calculate appropriate window size
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    
+    # Calculate window size (aim for 70% of screen height, maintain aspect ratio)
+    if screen_height >= 900:
+        # Large screen (1080p+)
+        window_width = 700
+        window_height = 650
+    elif screen_height >= 768:
+        # Medium screen (HD)
+        window_width = 650
+        window_height = 580
+    else:
+        # Small screen
+        window_width = 600
+        window_height = 520
+    
+    # Center window on screen
+    x_position = (screen_width - window_width) // 2
+    y_position = (screen_height - window_height) // 2
+    
+    root.geometry(f"{window_width}x{window_height}+{x_position}+{y_position}")
+    
+    # Lock window size (disable resizing)
+    root.resizable(False, False)
+    
+    # Set minimum size as fallback
+    root.minsize(600, 520)
 
     # Create notebook (tabbed interface)
     notebook = ttk.Notebook(root)
@@ -789,13 +1038,24 @@ def launch_gui():
     blocks_sent_var = tk.StringVar(value="0")
     blocks_recv_var = tk.StringVar(value="0")
     errors_var = tk.StringVar(value="0")
+    latency_var = tk.StringVar(value="N/A")
+    connection_var = tk.StringVar(value="Disconnected")
 
-    ttk.Label(stream_frame, text="Blocks sent:").grid(row=6, column=0, sticky=tk.W)
-    ttk.Label(stream_frame, textvariable=blocks_sent_var).grid(row=6, column=1, sticky=tk.W)
-    ttk.Label(stream_frame, text="Blocks received:").grid(row=7, column=0, sticky=tk.W)
-    ttk.Label(stream_frame, textvariable=blocks_recv_var).grid(row=7, column=1, sticky=tk.W)
-    ttk.Label(stream_frame, text="Errors:").grid(row=8, column=0, sticky=tk.W)
-    ttk.Label(stream_frame, textvariable=errors_var).grid(row=8, column=1, sticky=tk.W)
+    ttk.Label(stream_frame, text="Connection:").grid(row=6, column=0, sticky=tk.W)
+    connection_label = ttk.Label(stream_frame, textvariable=connection_var, foreground="red")
+    connection_label.grid(row=6, column=1, sticky=tk.W)
+    
+    ttk.Label(stream_frame, text="Blocks sent:").grid(row=7, column=0, sticky=tk.W)
+    ttk.Label(stream_frame, textvariable=blocks_sent_var).grid(row=7, column=1, sticky=tk.W)
+    
+    ttk.Label(stream_frame, text="Blocks received:").grid(row=8, column=0, sticky=tk.W)
+    ttk.Label(stream_frame, textvariable=blocks_recv_var).grid(row=8, column=1, sticky=tk.W)
+    
+    ttk.Label(stream_frame, text="Avg Latency:").grid(row=9, column=0, sticky=tk.W)
+    ttk.Label(stream_frame, textvariable=latency_var).grid(row=9, column=1, sticky=tk.W)
+    
+    ttk.Label(stream_frame, text="Errors:").grid(row=10, column=0, sticky=tk.W)
+    ttk.Label(stream_frame, textvariable=errors_var).grid(row=10, column=1, sticky=tk.W)
 
     # Helpers to map label text -> index
     in_map = {label: idx for label, idx in in_choices}
@@ -828,6 +1088,20 @@ def launch_gui():
             blocks_sent_var.set(str(stats.get("blocks_sent", 0)))
             blocks_recv_var.set(str(stats.get("blocks_received", 0)))
             errors_var.set(str(stats.get("errors", 0)))
+            avg_lat = stats.get("avg_latency_ms", 0.0)
+            if avg_lat > 0:
+                latency_var.set(f"{avg_lat:.1f} ms")
+            else:
+                latency_var.set("N/A")
+        
+        # Update connection status
+        if ws_connected.is_set():
+            connection_var.set("Connected")
+            connection_label.config(foreground="green")
+        else:
+            connection_var.set("Disconnected")
+            connection_label.config(foreground="red")
+        
         root.after(1000, refresh_stats)
 
     # ========================================
@@ -947,6 +1221,317 @@ def launch_gui():
 
     # Configure grid weights for resizing
     file_frame.columnconfigure(1, weight=1)
+
+    # ========================================
+    # TAB 3: Advanced Settings
+    # ========================================
+    settings_frame = ttk.Frame(notebook, padding=12)
+    notebook.add(settings_frame, text="Advanced Settings")
+
+    # Audio Processing Controls
+    ttk.Label(settings_frame, text="Audio Processing", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0,8))
+
+    # Input Gain
+    ttk.Label(settings_frame, text="Input Gain:").grid(row=1, column=0, sticky=tk.W)
+    input_gain_var = tk.DoubleVar(value=1.0)
+    input_gain_scale = ttk.Scale(settings_frame, from_=0.0, to=2.0, variable=input_gain_var, orient=tk.HORIZONTAL, length=250)
+    input_gain_scale.grid(row=1, column=1, sticky=tk.W+tk.E)
+    input_gain_label = ttk.Label(settings_frame, text="1.00x")
+    input_gain_label.grid(row=1, column=2, sticky=tk.W, padx=(4,0))
+
+    # Output Gain
+    ttk.Label(settings_frame, text="Output Gain:").grid(row=2, column=0, sticky=tk.W, pady=(8,0))
+    output_gain_var = tk.DoubleVar(value=1.0)
+    output_gain_scale = ttk.Scale(settings_frame, from_=0.0, to=2.0, variable=output_gain_var, orient=tk.HORIZONTAL, length=250)
+    output_gain_scale.grid(row=2, column=1, sticky=tk.W+tk.E, pady=(8,0))
+    output_gain_label = ttk.Label(settings_frame, text="1.00x")
+    output_gain_label.grid(row=2, column=2, sticky=tk.W, padx=(4,0), pady=(8,0))
+
+    # Dry/Wet Mix
+    ttk.Label(settings_frame, text="Dry/Wet Mix:").grid(row=3, column=0, sticky=tk.W, pady=(8,0))
+    mix_var = tk.DoubleVar(value=1.0)
+    mix_scale = ttk.Scale(settings_frame, from_=0.0, to=1.0, variable=mix_var, orient=tk.HORIZONTAL, length=250)
+    mix_scale.grid(row=3, column=1, sticky=tk.W+tk.E, pady=(8,0))
+    mix_label = ttk.Label(settings_frame, text="100% Wet")
+    mix_label.grid(row=3, column=2, sticky=tk.W, padx=(4,0), pady=(8,0))
+
+    # Noise Gate
+    ttk.Label(settings_frame, text="Noise Gate:").grid(row=4, column=0, sticky=tk.W, pady=(8,0))
+    noise_gate_var = tk.DoubleVar(value=-60.0)
+    noise_gate_scale = ttk.Scale(settings_frame, from_=-100.0, to=-20.0, variable=noise_gate_var, orient=tk.HORIZONTAL, length=250)
+    noise_gate_scale.grid(row=4, column=1, sticky=tk.W+tk.E, pady=(8,0))
+    noise_gate_label = ttk.Label(settings_frame, text="-60 dB")
+    noise_gate_label.grid(row=4, column=2, sticky=tk.W, padx=(4,0), pady=(8,0))
+
+    # Pass-through mode
+    pass_through_var = tk.BooleanVar(value=False)
+    pass_through_check = ttk.Checkbutton(settings_frame, text="Pass-through mode (bypass enhancement)", variable=pass_through_var)
+    pass_through_check.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(12,4))
+
+    # Apply button
+    def apply_settings():
+        with processing_lock:
+            processing_params["input_gain"] = input_gain_var.get()
+            processing_params["output_gain"] = output_gain_var.get()
+            processing_params["dry_wet_mix"] = mix_var.get()
+            processing_params["noise_gate_threshold"] = noise_gate_var.get()
+            processing_params["pass_through"] = pass_through_var.get()
+        preset_status_var.set("✓ Audio processing settings updated")
+        preset_status_label.config(foreground="green")
+        root.after(3000, lambda: preset_status_var.set(""))
+
+    apply_btn = ttk.Button(settings_frame, text="Apply Settings", command=apply_settings)
+    apply_btn.grid(row=6, column=1, sticky=tk.W, pady=(8,4))
+
+    # Presets
+    sep3 = ttk.Separator(settings_frame)
+    sep3.grid(row=7, column=0, columnspan=3, sticky="ew", pady=12)
+
+    ttk.Label(settings_frame, text="Presets", font=("Segoe UI", 10, "bold")).grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=(0,8))
+
+    # Status label for preset operations
+    preset_status_var = tk.StringVar(value="")
+    preset_status_label = ttk.Label(settings_frame, textvariable=preset_status_var, foreground="blue", font=("Segoe UI", 9))
+    preset_status_label.grid(row=8, column=0, columnspan=3, sticky=tk.E, pady=(0,8))
+
+    # Load custom presets
+    custom_presets = load_custom_presets()
+    all_presets = {**get_default_presets(), **custom_presets}
+
+    def load_preset(preset_name):
+        preset = all_presets.get(preset_name)
+        if preset:
+            input_gain_var.set(preset["input_gain"])
+            output_gain_var.set(preset["output_gain"])
+            mix_var.set(preset["mix"])
+            noise_gate_var.set(preset["noise_gate"])
+            pass_through_var.set(preset["pass_through"])
+            apply_settings()
+            preset_status_var.set(f"✓ Loaded preset: {preset_name}")
+            preset_status_label.config(foreground="green")
+            root.after(3000, lambda: preset_status_var.set(""))
+        else:
+            preset_status_var.set(f"✗ Preset '{preset_name}' not found")
+            preset_status_label.config(foreground="red")
+            root.after(3000, lambda: preset_status_var.set(""))
+
+    def save_current_as_preset():
+        """Save current settings as a named preset."""
+        # Create dialog for preset name
+        dialog = tk.Toplevel(root)
+        dialog.title("Save Preset")
+        dialog.geometry("350x120")
+        dialog.resizable(False, False)
+        dialog.transient(root)
+        dialog.grab_set()
+        
+        # Center dialog
+        dialog.update_idletasks()
+        x = root.winfo_x() + (root.winfo_width() - dialog.winfo_width()) // 2
+        y = root.winfo_y() + (root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+        
+        ttk.Label(dialog, text="Preset Name:").pack(pady=(10,5))
+        name_var = tk.StringVar()
+        name_entry = ttk.Entry(dialog, textvariable=name_var, width=30)
+        name_entry.pack(pady=5)
+        name_entry.focus()
+        
+        def save_preset():
+            preset_name = name_var.get().strip()
+            if not preset_name:
+                messagebox.showerror("Error", "Please enter a preset name", parent=dialog)
+                return
+            
+            # Check if overwriting default preset
+            if preset_name in get_default_presets():
+                messagebox.showerror("Error", f"Cannot overwrite built-in preset '{preset_name}'\nPlease choose a different name.", parent=dialog)
+                return
+            
+            # Check if overwriting existing custom preset
+            if preset_name in custom_presets:
+                if not messagebox.askyesno("Confirm Overwrite", f"Preset '{preset_name}' already exists.\nDo you want to overwrite it?", parent=dialog):
+                    return
+            
+            # Save current settings
+            new_preset = {
+                "input_gain": input_gain_var.get(),
+                "output_gain": output_gain_var.get(),
+                "mix": mix_var.get(),
+                "noise_gate": noise_gate_var.get(),
+                "pass_through": pass_through_var.get()
+            }
+            
+            custom_presets[preset_name] = new_preset
+            all_presets[preset_name] = new_preset
+            
+            if save_custom_presets(custom_presets):
+                dialog.destroy()
+                update_preset_dropdown()
+                preset_status_var.set(f"✓ Preset '{preset_name}' saved successfully")
+                preset_status_label.config(foreground="green")
+                root.after(3000, lambda: preset_status_var.set(""))
+            else:
+                dialog.destroy()
+                preset_status_var.set("✗ Failed to save preset")
+                preset_status_label.config(foreground="red")
+                root.after(3000, lambda: preset_status_var.set(""))
+        
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(pady=10)
+        ttk.Button(button_frame, text="Save", command=save_preset).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+        
+        # Bind Enter key to save
+        name_entry.bind('<Return>', lambda e: save_preset())
+
+    def delete_preset():
+        """Delete a custom preset."""
+        selected = preset_combo.get()
+        if not selected:
+            messagebox.showwarning("Warning", "Please select a preset to delete")
+            return
+        
+        if selected in get_default_presets():
+            messagebox.showerror("Error", "Cannot delete built-in presets")
+            return
+        
+        if selected not in custom_presets:
+            messagebox.showerror("Error", "Selected preset not found")
+            return
+        
+        if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete preset '{selected}'?"):
+            del custom_presets[selected]
+            del all_presets[selected]
+            if save_custom_presets(custom_presets):
+                update_preset_dropdown()
+                preset_status_var.set(f"✓ Preset '{selected}' deleted")
+                preset_status_label.config(foreground="green")
+                root.after(3000, lambda: preset_status_var.set(""))
+            else:
+                preset_status_var.set("✗ Failed to delete preset")
+                preset_status_label.config(foreground="red")
+                root.after(3000, lambda: preset_status_var.set(""))
+
+    def update_preset_dropdown():
+        """Update the preset dropdown with current presets."""
+        preset_names = list(all_presets.keys())
+        preset_combo['values'] = preset_names
+        if preset_names:
+            preset_combo.current(0)
+
+    # Preset selection and management
+    preset_mgmt_frame = ttk.Frame(settings_frame)
+    preset_mgmt_frame.grid(row=9, column=0, columnspan=3, sticky=tk.W+tk.E)
+    
+    # Dropdown for preset selection
+    preset_combo = ttk.Combobox(preset_mgmt_frame, state="readonly", width=25)
+    preset_combo['values'] = list(all_presets.keys())
+    if preset_combo['values']:
+        preset_combo.current(0)
+    preset_combo.pack(side=tk.LEFT, padx=(0,4))
+    
+    ttk.Button(preset_mgmt_frame, text="Load", command=lambda: load_preset(preset_combo.get()), width=8).pack(side=tk.LEFT, padx=(0,4))
+    ttk.Button(preset_mgmt_frame, text="Save As...", command=save_current_as_preset, width=10).pack(side=tk.LEFT, padx=(0,4))
+    ttk.Button(preset_mgmt_frame, text="Delete", command=delete_preset, width=8).pack(side=tk.LEFT, padx=(0,4))
+    
+    # Quick access to default presets
+    default_preset_frame = ttk.Frame(settings_frame)
+    default_preset_frame.grid(row=10, column=0, columnspan=3, sticky=tk.W, pady=(8,0))
+    ttk.Label(default_preset_frame, text="Quick Load:", font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(0,4))
+    ttk.Button(default_preset_frame, text="Default", command=lambda: load_preset("Default"), width=8).pack(side=tk.LEFT, padx=(0,2))
+    ttk.Button(default_preset_frame, text="Boost", command=lambda: load_preset("Boost"), width=8).pack(side=tk.LEFT, padx=(0,2))
+    ttk.Button(default_preset_frame, text="Subtle", command=lambda: load_preset("Subtle"), width=8).pack(side=tk.LEFT, padx=(0,2))
+    ttk.Button(default_preset_frame, text="Aggressive", command=lambda: load_preset("Aggressive"), width=10).pack(side=tk.LEFT, padx=(0,2))
+
+    # Audio Levels Display
+    sep4 = ttk.Separator(settings_frame)
+    sep4.grid(row=11, column=0, columnspan=3, sticky="ew", pady=12)
+
+    ttk.Label(settings_frame, text="Audio Levels", font=("Segoe UI", 10, "bold")).grid(row=12, column=0, columnspan=3, sticky=tk.W, pady=(0,8))
+
+    input_level_var = tk.StringVar(value="-100 dB")
+    output_level_var = tk.StringVar(value="-100 dB")
+
+    ttk.Label(settings_frame, text="Input:").grid(row=13, column=0, sticky=tk.W)
+    input_level_label = ttk.Label(settings_frame, textvariable=input_level_var, font=("Consolas", 10))
+    input_level_label.grid(row=13, column=1, sticky=tk.W)
+
+    ttk.Label(settings_frame, text="Output:").grid(row=14, column=0, sticky=tk.W)
+    output_level_label = ttk.Label(settings_frame, textvariable=output_level_var, font=("Consolas", 10))
+    output_level_label.grid(row=14, column=1, sticky=tk.W)
+
+    # Recording Controls
+    sep5 = ttk.Separator(settings_frame)
+    sep5.grid(row=15, column=0, columnspan=3, sticky="ew", pady=12)
+
+    ttk.Label(settings_frame, text="Recording", font=("Segoe UI", 10, "bold")).grid(row=16, column=0, columnspan=3, sticky=tk.W, pady=(0,8))
+
+    recording_status_var = tk.StringVar(value="Not recording")
+    ttk.Label(settings_frame, textvariable=recording_status_var).grid(row=17, column=0, columnspan=2, sticky=tk.W)
+
+    is_recording = tk.BooleanVar(value=False)
+
+    def toggle_recording():
+        if is_recording.get():
+            # Stop recording
+            audio = stop_recording()
+            is_recording.set(False)
+            recording_status_var.set("Not recording")
+            record_btn.config(text="Start Recording")
+            
+            if len(audio) > 0:
+                # Ask where to save
+                filename = filedialog.asksaveasfilename(
+                    title="Save Recording",
+                    defaultextension=".wav",
+                    filetypes=[("WAV files", "*.wav"), ("All files", "*.*")]
+                )
+                if filename:
+                    save_recording(audio, filename)
+                    messagebox.showinfo("Success", f"Recording saved to:\n{filename}")
+        else:
+            # Start recording
+            start_recording()
+            is_recording.set(True)
+            recording_status_var.set("Recording...")
+            record_btn.config(text="Stop Recording")
+
+    record_btn = ttk.Button(settings_frame, text="Start Recording", command=toggle_recording)
+    record_btn.grid(row=18, column=0, columnspan=2, sticky=tk.W, pady=(4,0))
+
+    # Update labels for sliders
+    def update_slider_labels(*args):
+        input_gain_label.config(text=f"{input_gain_var.get():.2f}x")
+        output_gain_label.config(text=f"{output_gain_var.get():.2f}x")
+        mix_val = mix_var.get()
+        if mix_val == 0.0:
+            mix_label.config(text="100% Dry")
+        elif mix_val == 1.0:
+            mix_label.config(text="100% Wet")
+        else:
+            mix_label.config(text=f"{mix_val*100:.0f}% Wet")
+        ng_val = noise_gate_var.get()
+        if ng_val <= -100.0:
+            noise_gate_label.config(text="OFF")
+        else:
+            noise_gate_label.config(text=f"{ng_val:.0f} dB")
+
+    input_gain_var.trace_add("write", update_slider_labels)
+    output_gain_var.trace_add("write", update_slider_labels)
+    mix_var.trace_add("write", update_slider_labels)
+    noise_gate_var.trace_add("write", update_slider_labels)
+
+    # Update audio levels periodically
+    def update_levels():
+        input_level_var.set(f"{audio_levels.get('input_level', -100):.1f} dB")
+        output_level_var.set(f"{audio_levels.get('output_level', -100):.1f} dB")
+        root.after(100, update_levels)  # Update every 100ms
+
+    update_levels()
+
+    # Configure grid weights
+    settings_frame.columnconfigure(1, weight=1)
 
     # ========================================
     # Main window cleanup
