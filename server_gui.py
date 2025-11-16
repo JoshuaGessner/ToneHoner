@@ -36,7 +36,15 @@ class ServerController:
         self.host = host
         self.port = int(port)
 
-        config = uvicorn.Config(app, host=self.host, port=self.port, log_level="info")
+        # Disable uvicorn's default logging config to avoid PyInstaller issues
+        # Use a simple log config that doesn't rely on formatters
+        config = uvicorn.Config(
+            app, 
+            host=self.host, 
+            port=self.port, 
+            log_level="info",
+            log_config=None  # Disable default logging config
+        )
         self.server = uvicorn.Server(config)
         # Avoid installing signal handlers in a background thread (prevents Ctrl+C noise)
         try:
