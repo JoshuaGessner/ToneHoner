@@ -110,7 +110,36 @@ class ServerGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("ToneHoner Server Console")
-        self.root.geometry("720x520")
+        
+        # Get screen dimensions and calculate appropriate window size
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        
+        # Calculate window size (smaller than client since server has less content)
+        if screen_height >= 900:
+            # Large screen (1080p+)
+            window_width = 550
+            window_height = 480
+        elif screen_height >= 768:
+            # Medium screen (HD)
+            window_width = 500
+            window_height = 440
+        else:
+            # Small screen
+            window_width = 480
+            window_height = 400
+        
+        # Center window on screen
+        x_position = (screen_width - window_width) // 2
+        y_position = (screen_height - window_height) // 2
+        
+        self.root.geometry(f"{window_width}x{window_height}+{x_position}+{y_position}")
+        
+        # Lock window size (disable resizing)
+        self.root.resizable(False, False)
+        
+        # Set minimum size as fallback
+        self.root.minsize(480, 400)
 
         self.controller = ServerController()
         self._save_job = None

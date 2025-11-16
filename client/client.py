@@ -149,6 +149,50 @@ OUTPUT_DEVICE = None  # Virtual audio device output index (e.g., 4 for VB-Cable,
 # WebSocket configuration
 SERVER_URL = "ws://localhost:8000/enhance"
 
+# --- Persistent client settings (e.g., server URL) ---
+def _client_config_dir() -> Path:
+    try:
+        d = Path.home() / ".tonehoner"
+        d.mkdir(exist_ok=True)
+        return d
+    except Exception:
+        # Fallback to current directory on failure
+        return Path(os.path.abspath(os.path.dirname(__file__)))
+
+
+def _client_settings_path() -> Path:
+    return _client_config_dir() / "client_settings.json"
+
+
+def load_client_settings() -> dict:
+    p = _client_settings_path()
+    if p.exists():
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Warning: Failed to load client settings: {e}")
+    return {}
+
+
+def save_client_settings(settings: dict) -> bool:
+    try:
+        with open(_client_settings_path(), "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"Warning: Failed to save client settings: {e}")
+        return False
+
+
+# Load persisted settings (server URL)
+try:
+    _loaded = load_client_settings()
+    if isinstance(_loaded, dict) and _loaded.get("server_url"):
+        SERVER_URL = str(_loaded.get("server_url")).strip() or SERVER_URL
+except Exception:
+    pass
+
 # Thread-safe queues for audio data
 input_queue = Queue(maxsize=32)   # Captured audio blocks (larger to absorb jitter)
 output_queue = Queue(maxsize=32)  # Enhanced audio blocks
@@ -820,6 +864,13 @@ def main():
             input_path = Path(input_file)
             output_file = str(input_path.parent / f"{input_path.stem}_enhanced{input_path.suffix}")
         
+        # Persist server URL used for file processing
+        try:
+            if args.server:
+                save_client_settings({"server_url": args.server})
+        except Exception:
+            pass
+
         # Process the file
         success = asyncio.run(process_audio_file(input_file, output_file, args.server))
         sys.exit(0 if success else 1)
@@ -828,6 +879,13 @@ def main():
     SERVER_URL = args.server
     INPUT_DEVICE = args.input_device
     OUTPUT_DEVICE = args.output_device
+
+    # Persist server URL for real-time streaming
+    try:
+        if SERVER_URL:
+            save_client_settings({"server_url": SERVER_URL})
+    except Exception:
+        pass
     
     print("=" * 60)
     print("Real-time Audio Enhancement Client")
@@ -888,6 +946,10 @@ class ClientController:
 
         # Update globals
         SERVER_URL = server_url
+        try:
+            save_client_settings({"server_url": SERVER_URL})
+        except Exception:
+            pass
         INPUT_DEVICE = input_device if input_device != "default" else None
         OUTPUT_DEVICE = output_device if output_device != "default" else None
 
@@ -1178,6 +1240,12 @@ def launch_gui():
         input_file = input_file_var.get().strip()
         output_file = output_file_var.get().strip()
         server_url = file_server_var.get().strip()
+        # Persist latest server URL from File Processing tab
+        try:
+            if server_url:
+                save_client_settings({"server_url": server_url})
+        except Exception:
+            pass
 
         if not input_file:
             messagebox.showerror("Error", "Please select an input file")
